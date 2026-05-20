@@ -5,7 +5,8 @@
 // @description  Painel inteligente local para Ahgora
 // @author       Jonathan Fiss
 
-// @match        https://mirror.app.ahgora.com.br/*
+// @match https://mirror.app.ahgora.com.br/*
+// @match https://app.ahgora.com.br/*
 
 // @grant        none
 // @run-at       document-idle
@@ -231,13 +232,18 @@
 
     function notif(id, title, body, urgente = false) {
 
-        if (
-            _fired.has(id) ||
-            !('Notification' in window) ||
-            Notification.permission !== 'granted'
-        ) return;
+        if (_fired.has(id)) {
+            return;
+        }
 
         _fired.add(id);
+
+        if (
+            !('Notification' in window) ||
+            Notification.permission !== 'granted'
+        ) {
+            return;
+        }
 
         try {
 
@@ -247,7 +253,10 @@
                 tag: id
             });
 
-        } catch { }
+        } catch (e) {
+
+            console.error(e);
+        }
     }
 
     function checarNotifs(resumo) {
@@ -288,7 +297,7 @@
             '6h',
             '6h atingidas',
             'Você completou o mínimo de 6h.',
-            false
+            true
         );
 
         chk(
@@ -296,7 +305,7 @@
             '8h',
             'Meta diária',
             'Você completou as 8h.',
-            true
+            false
         );
 
         chk(
@@ -1557,5 +1566,38 @@
     }, 1000);
 
     pedirNotif();
+
+    const IS_TOP = window.top === window;
+    if (IS_TOP) {
+
+        console.log(
+            '[AHGORA PANEL] TOP WINDOW'
+        );
+
+        pedirNotif();
+
+        setTimeout(() => {
+
+            notif(
+                'startup',
+                'Ahgora',
+                'Notificações ativadas.',
+                false
+            );
+
+        }, 3000);
+
+        setInterval(() => {
+
+            console.log(
+                '[AHGORA PANEL] reload top'
+            );
+
+            location.reload();
+
+        }, CONFIG.AUTO_REFRESH_MINUTES * 60 * 1000);
+
+        return;
+    }
 
 })();
