@@ -1,14 +1,14 @@
 // ==UserScript==
 // @name         Ahgora — Painel Inteligente Local
 // @namespace    https://github.com/jonathanfiss
-// @version      2.0.2
+// @version      2.1.0
 // @description  Painel inteligente local para Ahgora
 // @author       Jonathan Fiss
 
 // @match https://mirror.app.ahgora.com.br/*
 // @match https://app.ahgora.com.br/*
 
-// @grant        none
+// @grant        GM_notification
 // @run-at       document-idle
 
 // @downloadURL  https://github.com/jonathanfiss/js.controle-ponto-Ahgora/raw/refs/heads/master/ahgora-panel.user.js
@@ -24,26 +24,50 @@
     ========================================================= */
 
     const CONFIG = {
-        CARGA_DIARIA:       8 * 60,
+        // Jornada
+        CARGA_DIARIA:       8 * 60,       // minutos
         MAX_HORAS_DIA:      10 * 60,
         MAX_HORAS_TURNO:    6 * 60,
         AVISO_TURNO:        30,
         AVISO_DIA:          30,
         INTERVALO_MINIMO:   30,
-        INTERVALO_MAXIMO:   3 * 60,
-        DESCANSO_MINIMO:    11 * 60,
-        TOLERANCIA:         10,        // minutos — saldo dentro desse intervalo é zerado
-        UPDATE_INTERVAL:    1 * 1000,
+        INTERVALO_MAXIMO:   3 * 60 + 30,  // CLT: máximo 3h30
+        DESCANSO_MINIMO:    11 * 60,      // interjornada mínima
+        TOLERANCIA:         10,           // minutos — saldo dentro desse intervalo é zerado
+        // Sistema
         AUTO_REFRESH_MIN:   15,
-        VERSAO:             '2.0.0',
+        VERSAO:             '2.1.0',
+        SCHEMA_VERSION:     1,
+        DEBUG_NOTIF:        false,  // true → mostra painel de testes de notificação no UI
+        // URLs
         URL_REFRESH:        'https://app.ahgora.com.br/externo/mirror',
         BATIDA_URL:         'https://app.ahgora.com.br/novabatidaonline/',
         NOTIFICACOES: {
-            h6:    [10, 5, 4, 3, 2, 1],
-            h8:    [10, 5, 4, 3, 2, 1],
-            h10:   [10, 5, 4, 3, 2, 1],
-            ideal: [5, 1]
-        }
+            h6:     [10, 5, 4, 3, 2, 1],
+            h8:     [10, 5, 4, 3, 2, 1],
+            h10:    [10, 5, 4, 3, 2, 1],
+            ideal:  [5, 1],
+            // Lembretes de entrada: dispara N minutos antes do horário padrão de entrada
+            // Ajuste HORARIO_ENTRADA_PADRAO para o seu horário de trabalho
+            HORARIO_ENTRADA_PADRAO: '08:00',   // "HH:MM" — usado como ancoragem do lembrete de entrada
+            entrada: [15, 5]                   // avisar 15 e 5 minutos antes da entrada
+        },
+        // Janela de recuperação de notificações perdidas (ms)
+        // Aumentada para cobrir casos de "abri o browser agora"
+        NOTIF_RECOVERY_WINDOW_MS: 4 * 60 * 60 * 1000,  // 4 horas
+    };
+
+    // REGRAS aponta para as mesmas constantes de CONFIG — fonte única de verdade
+    CONFIG.REGRAS = {
+        CARGA_DIARIA:          CONFIG.CARGA_DIARIA,
+        MAX_DIA:               CONFIG.MAX_HORAS_DIA,
+        MAX_TURNO:             CONFIG.MAX_HORAS_TURNO,
+        INTERVALO_MIN:         CONFIG.INTERVALO_MINIMO,
+        INTERVALO_MAX:         CONFIG.INTERVALO_MAXIMO,
+        DESCANSO_INTERJORNADA: CONFIG.DESCANSO_MINIMO,
+        MAX_DIAS_CONSECUTIVOS: 6,
+        ON_CALL_MAX:           24 * 60,
+        ON_CALL_DESCANSO:      CONFIG.DESCANSO_MINIMO
     };
 
     /* =========================================================
@@ -52,6 +76,8 @@
 
     const STATE = {
         menuRelatorios:   false,
+        menuDebug:        false,
+        statusExpandido:  false,
         nextRefresh:      Date.now() + CONFIG.AUTO_REFRESH_MIN * 60 * 1000,
         dragging:         false,
         dragOX:           0,
@@ -60,6 +86,530 @@
         notificationsFired: new Map(),
         // Período visível no calendário (pode diferir do mês atual)
         periodoSelecionado: { ano: null, mes: null }
+    };
+
+    /* =========================================================
+       Utilitários internos
+    ========================================================= */
+
+    // Data de hoje como "YYYY-MM-DD" — usada em WorkdayStore, NotifScheduler, checarNotifs
+    function todayDateStr() {
+        const d = new Date();
+        return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+    }
+
+    // Converte "HH:MM" → minutos desde meia-noite
+    function hmToMin(s) {
+        const [h, m] = s.split(':').map(Number);
+        return h * 60 + m;
+    }
+
+    /* =========================================================
+       WorkdayStore — persistent workday state (localStorage)
+    =========================================================
+       Key: "ahg_workday_<YYYY-MM-DD>"
+       Schema v1:
+       {
+           schemaVersion: 1,
+           date: "YYYY-MM-DD",
+           entries: [
+               { type, time, source, createdAt }
+           ],
+           status: "OPEN" | "COMPLETED"
+       }
+       Event types (ACTUAL):
+           WORK_START, BREAK_START, BREAK_END, WORK_END
+       Source:
+           DOM   — read from calendar DOM (.batida elements)
+           MANUAL — explicitly registered by user
+    ========================================================= */
+
+    const WorkdayStore = {
+
+        _keyFor(dateStr) {
+            return `ahg_workday_${dateStr}`;
+        },
+
+        // Delegação para o helper central
+        _todayStr() { return todayDateStr(); },
+
+        load(dateStr) {
+            try {
+                const raw = localStorage.getItem(this._keyFor(dateStr));
+                if (!raw) return null;
+                const obj = JSON.parse(raw);
+                if (!obj || obj.schemaVersion !== CONFIG.SCHEMA_VERSION) return null;
+                return obj;
+            } catch {
+                return null;
+            }
+        },
+
+        save(workday) {
+            try {
+                localStorage.setItem(this._keyFor(workday.date), JSON.stringify(workday));
+            } catch (e) {
+                console.warn('[WorkdayStore] save failed:', e);
+            }
+        },
+
+        loadToday() {
+            const dateStr = this._todayStr();
+            return this.load(dateStr) || {
+                schemaVersion: CONFIG.SCHEMA_VERSION,
+                date: dateStr,
+                entries: [],
+                status: 'OPEN'
+            };
+        },
+
+        syncFromDom(batidas) {
+            const wd = this.loadToday();
+            const TYPES = ['WORK_START', 'BREAK_START', 'BREAK_END', 'WORK_END'];
+            let dirty = false;
+
+            batidas.forEach((time, idx) => {
+                if (!time) return;
+                const type = TYPES[idx] || `PUNCH_${idx + 1}`;
+                const existing = wd.entries.find(e => e.type === type);
+
+                if (!existing) {
+                    wd.entries.push({ type, time, source: 'DOM', createdAt: new Date().toISOString() });
+                    dirty = true;
+                } else if (existing.source === 'DOM' && existing.time !== time) {
+                    existing.time = time;
+                    existing.createdAt = new Date().toISOString();
+                    dirty = true;
+                }
+                // MANUAL entries are never overwritten by DOM sync
+            });
+
+            if (wd.entries.length >= 4 && wd.status === 'OPEN') {
+                wd.status = 'COMPLETED';
+                dirty = true;
+            }
+
+            if (dirty) this.save(wd);
+            return wd;
+        },
+
+        registerManual(type, time) {
+            const wd = this.loadToday();
+            const existing = wd.entries.find(e => e.type === type);
+            if (existing) {
+                existing.time      = time;
+                existing.source    = 'MANUAL';
+                existing.createdAt = new Date().toISOString();
+            } else {
+                wd.entries.push({ type, time, source: 'MANUAL', createdAt: new Date().toISOString() });
+            }
+            if (type === 'WORK_END') wd.status = 'COMPLETED';
+            this.save(wd);
+            return wd;
+        },
+
+        pruneOld(days = 35) {
+            try {
+                const cutoff = new Date();
+                cutoff.setDate(cutoff.getDate() - days);
+                Object.keys(localStorage)
+                    .filter(k => k.startsWith('ahg_workday_'))
+                    .forEach(k => {
+                        const dateStr = k.replace('ahg_workday_', '');
+                        if (new Date(dateStr) < cutoff) localStorage.removeItem(k);
+                    });
+            } catch { /* silent */ }
+        }
+    };
+
+    /* =========================================================
+       EventEngine — actual events vs predictions
+    =========================================================
+       Consumes a WorkdayStore record + DOM batidas and produces:
+       {
+           actual:   { WORK_START, BREAK_START, BREAK_END, WORK_END }
+           predicted: { WORK_END, BREAK_RETURN_MIN, BREAK_RETURN_MAX }
+           effectiveBatidas: string[]   ← used by Jornada.*
+           status: "OPEN" | "COMPLETED"
+           frozen: boolean              ← true when WORK_END is an actual event
+       }
+
+       Rule: actual events take precedence over predictions.
+             Once frozen=true, Jornada.calcularTrabalhado uses the
+             actual WORK_END instead of Hora.nowMin().
+    ========================================================= */
+
+    const EventEngine = {
+
+        TYPE_ORDER: ['WORK_START', 'BREAK_START', 'BREAK_END', 'WORK_END'],
+
+        // Build effective batidas array using actual entries when available,
+        // falling back to DOM-sourced batidas otherwise.
+        // Returns { effectiveBatidas, actual, frozen }
+        resolve(workday, domBatidas) {
+            // Index entries by type in one pass
+            const actual = (workday.entries || []).reduce((acc, e) => {
+                acc[e.type] = e;
+                return acc;
+            }, {});
+
+            // Prefer MANUAL/actual entries; fall back to DOM
+            const effectiveBatidas = this.TYPE_ORDER
+                .map((type, idx) => actual[type]?.time ?? domBatidas[idx] ?? null)
+                .filter(Boolean);
+
+            // Append extra punches beyond the 4 known types
+            domBatidas.slice(this.TYPE_ORDER.length).forEach(t => { if (t) effectiveBatidas.push(t); });
+
+            const frozen = !!actual['WORK_END'];
+            return { effectiveBatidas, actual, frozen };
+        },
+
+        status(workday) {
+            return workday.status || 'OPEN';
+        }
+    };
+
+    /* =========================================================
+       RuleEngine — configurable business-rule validation
+    =========================================================
+       Each rule returns:
+       {
+           rule: string,
+           status: "OK" | "WARNING" | "VIOLATION" | "INFO",
+           severity: "INFO" | "WARNING" | "ERROR",
+           details: {}
+       }
+    ========================================================= */
+
+    const RuleEngine = {
+
+        evaluate(batidas, trabalhado) {
+            return [
+                this.dailyLimitRule(trabalhado),
+                this.shiftLimitRule(batidas),
+                this.breakRule(batidas),
+                this.interjourneyRestRule(batidas)
+            ].filter(Boolean);
+        },
+
+        dailyLimitRule(trabalhado) {
+            const max = CONFIG.MAX_HORAS_DIA;
+            if (trabalhado > max) {
+                return { rule: 'DAILY_LIMIT', status: 'VIOLATION', severity: 'ERROR',
+                         details: { maxMinutes: max, actualMinutes: trabalhado, excessMinutes: trabalhado - max } };
+            }
+            if (trabalhado > CONFIG.CARGA_DIARIA) {
+                return { rule: 'DAILY_LIMIT', status: 'WARNING', severity: 'WARNING',
+                         details: { maxMinutes: max, actualMinutes: trabalhado, overtimeMinutes: trabalhado - CONFIG.CARGA_DIARIA } };
+            }
+            return { rule: 'DAILY_LIMIT', status: 'OK', severity: 'INFO', details: { actualMinutes: trabalhado } };
+        },
+
+        shiftLimitRule(batidas) {
+            if (batidas.length < 1) return null;
+            let maxShift = 0;
+            for (let i = 0; i < batidas.length; i += 2) {
+                const start = hmToMin(batidas[i]);
+                const end   = batidas[i + 1] ? hmToMin(batidas[i + 1]) : Hora.nowMin();
+                maxShift = Math.max(maxShift, end - start);
+            }
+            const max = CONFIG.MAX_HORAS_TURNO;
+            if (maxShift > max) {
+                return { rule: 'SHIFT_LIMIT', status: 'VIOLATION', severity: 'ERROR',
+                         details: { maxMinutes: max, actualMinutes: maxShift } };
+            }
+            return { rule: 'SHIFT_LIMIT', status: 'OK', severity: 'INFO', details: { actualMinutes: maxShift } };
+        },
+
+        breakRule(batidas) {
+            if (batidas.length < 3) return null;
+            const breakMin = hmToMin(batidas[2]) - hmToMin(batidas[1]);
+            const min = CONFIG.INTERVALO_MINIMO;
+            const max = CONFIG.INTERVALO_MAXIMO;
+            if (breakMin < min) {
+                return { rule: 'BREAK', status: 'VIOLATION', severity: 'ERROR',
+                         details: { requiredMinutes: min, actualMinutes: breakMin } };
+            }
+            if (breakMin > max) {
+                return { rule: 'BREAK', status: 'WARNING', severity: 'WARNING',
+                         details: { maxMinutes: max, actualMinutes: breakMin } };
+            }
+            return { rule: 'BREAK', status: 'OK', severity: 'INFO', details: { actualMinutes: breakMin } };
+        },
+
+        interjourneyRestRule(batidas) {
+            if (batidas.length < 1) return null;
+            const d = new Date();
+            d.setDate(d.getDate() - 1);
+            const yesterday = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+
+            const ydWd = WorkdayStore.load(yesterday);
+            if (!ydWd) return null;
+
+            const ydEnd = ydWd.entries.find(e => e.type === 'WORK_END');
+            if (!ydEnd) return null;
+
+            const restMins = (24 * 60 - hmToMin(ydEnd.time)) + hmToMin(batidas[0]);
+            const required = CONFIG.DESCANSO_MINIMO;
+
+            if (restMins < required) {
+                return { rule: 'INTERJOURNEY_REST', status: 'VIOLATION', severity: 'WARNING',
+                         details: { requiredMinutes: required, actualMinutes: restMins } };
+            }
+            return { rule: 'INTERJOURNEY_REST', status: 'OK', severity: 'INFO', details: { actualMinutes: restMins } };
+        }
+    };
+
+    /* =========================================================
+       NotifScheduler — persistent notification schedule/recovery
+    =========================================================
+       Key: "ahg_notif_schedule"
+       Schema:
+       {
+           schedules: [
+               { id, type, scheduledFor (ISO), workdayDate, calcVersion, fired }
+           ]
+       }
+
+       On page/iframe load:
+       1. Load schedules
+       2. Remove outdated (different workdayDate or already obsoleted by actual event)
+       3. For scheduled events still in the future: set up setTimeout
+       4. For scheduled events in the past (missed): fire immediately if < 60 min ago
+
+       Deduplication: each id is unique; a new calcVersion obsoletes older schedules
+       for the same type+workdayDate.
+    ========================================================= */
+
+    const NotifScheduler = {
+
+        _KEY: 'ahg_notif_schedule',
+        _calcVersion: 0,
+        _timers: new Map(),
+
+        load() {
+            try {
+                const raw = localStorage.getItem(this._KEY);
+                return raw ? JSON.parse(raw) : { schedules: [] };
+            } catch { return { schedules: [] }; }
+        },
+
+        save(data) {
+            try {
+                localStorage.setItem(this._KEY, JSON.stringify(data));
+            } catch { /* silent */ }
+        },
+
+        // Schedule a future notification.
+        // scheduledFor: ISO string  e.g. "2026-10-02T18:00:00"
+        schedule(id, type, scheduledFor, workdayDate) {
+            const data = this.load();
+            this._calcVersion++;
+
+            // Remove older schedules of same type+workdayDate
+            data.schedules = data.schedules.filter(
+                s => !(s.type === type && s.workdayDate === workdayDate)
+            );
+
+            data.schedules.push({
+                id,
+                type,
+                scheduledFor,
+                workdayDate,
+                calcVersion: this._calcVersion,
+                fired: false
+            });
+            this.save(data);
+            this._arm(id, type, scheduledFor, workdayDate);
+        },
+
+        // Cancel all schedules for a given type+workdayDate (e.g. after actual exit)
+        cancel(type, workdayDate) {
+            const data = this.load();
+            const removed = data.schedules.filter(s => s.type === type && s.workdayDate === workdayDate);
+            removed.forEach(s => {
+                const t = this._timers.get(s.id);
+                if (t) { clearTimeout(t); this._timers.delete(s.id); }
+            });
+            data.schedules = data.schedules.filter(
+                s => !(s.type === type && s.workdayDate === workdayDate)
+            );
+            this.save(data);
+        },
+
+        // Recover and replay on page load
+        recover(workdayDate) {
+            const data = this.load();
+            const now  = Date.now();
+            const MISSED_WINDOW_MS = CONFIG.NOTIF_RECOVERY_WINDOW_MS;
+
+            data.schedules
+                .filter(s => s.workdayDate === workdayDate && !s.fired)
+                .forEach(s => {
+                    const t = new Date(s.scheduledFor).getTime();
+                    const diff = t - now;
+
+                    if (diff > 0) {
+                        // Ainda no futuro — armar timer
+                        this._arm(s.id, s.type, s.scheduledFor, s.workdayDate);
+                    } else if (diff > -MISSED_WINDOW_MS) {
+                        // Perdida mas recente — disparar agora com contexto de "atrasado"
+                        this._fireMissed(s.id, s.type, new Date(s.scheduledFor));
+                    }
+                    // Mais antiga que a janela: descartar silenciosamente
+                });
+        },
+
+        _arm(id, type, scheduledFor, workdayDate) {
+            const ms = new Date(scheduledFor).getTime() - Date.now();
+            if (ms <= 0) return;
+
+            const existing = this._timers.get(id);
+            if (existing) clearTimeout(existing);
+
+            const timer = setTimeout(() => {
+                this._fire(id, type);
+            }, ms);
+
+            this._timers.set(id, timer);
+        },
+
+        _fire(id, type) {
+            const data = this.load();
+            const sched = data.schedules.find(s => s.id === id);
+            if (!sched || sched.fired) return;
+
+            sched.fired = true;
+            this.save(data);
+
+            const LABELS = {
+                EXPECTED_EXIT_H8:    { title: '✅ Meta diária',       body: 'Você completou as 8h.' },
+                EXPECTED_EXIT_H6:    { title: '⚠️ Limite de turno',   body: 'Você atingiu 6h de turno.' },
+                EXPECTED_EXIT_H10:   { title: '⛔ Limite diário',     body: 'Atenção: 10h atingidas.' },
+                EXPECTED_EXIT_IDEAL: { title: '🏆 Saída ideal',       body: 'Saldo semanal compensado.' },
+                ENTRY_REMINDER:      { title: '⏰ Hora de bater ponto!', body: 'Lembre de registrar sua entrada.' }
+            };
+            const lbl = LABELS[type] || { title: `⏰ ${type}`, body: '' };
+            notif(`sched-${id}`, lbl.title, lbl.body, type.includes('H10') || type === 'ENTRY_REMINDER', 0);
+            this._timers.delete(id);
+        },
+
+        // Disparada quando uma notificação foi perdida (página estava fechada).
+        // Inclui o horário original programado na mensagem para dar contexto.
+        _fireMissed(id, type, scheduledDate) {
+            const data = this.load();
+            const sched = data.schedules.find(s => s.id === id);
+            if (!sched || sched.fired) return;
+
+            sched.fired = true;
+            this.save(data);
+
+            const hora = scheduledDate
+                ? `${String(scheduledDate.getHours()).padStart(2, '0')}:${String(scheduledDate.getMinutes()).padStart(2, '0')}`
+                : '';
+
+            const LABELS_MISSED = {
+                EXPECTED_EXIT_H8:    { title: '⚠️ Você já deveria ter saído',  body: `Meta de 8h era às ${hora}. Bata o ponto agora se ainda está trabalhando.` },
+                EXPECTED_EXIT_H6:    { title: '⚠️ Turno excedeu 6h',           body: `Limite de turno era às ${hora}.` },
+                EXPECTED_EXIT_H10:   { title: '🚨 Limite diário ultrapassado', body: `10h foram atingidas às ${hora}. Bata o ponto de saída.` },
+                EXPECTED_EXIT_IDEAL: { title: '⏰ Saída ideal foi às ' + hora,  body: 'Saldo semanal já foi compensado.' },
+                ENTRY_REMINDER:      { title: '⏰ Não esqueça de bater o ponto', body: `Seu horário de entrada era às ${hora}.` }
+            };
+            const lbl = LABELS_MISSED[type] || { title: `⏰ Perdida: ${type}`, body: `Programada para ${hora}.` };
+            notif(`missed-${id}`, lbl.title, lbl.body, true, 0);
+            this._timers.delete(id);
+        },
+
+        // Called from checarNotifs to update the persistent schedule.
+        // Single load + single save per render tick.
+        updateFromContext(ctx, todayStr) {
+            const { jornadaHoje } = ctx;
+            const frozen = ctx.frozen || false;
+
+            // ── Helper interno: upsert uma entrada no batch ──────────────────
+            const upsert = (data, id, type, iso) => {
+                data.schedules = data.schedules.filter(
+                    s => !(s.type === type && s.workdayDate === todayStr)
+                );
+                data.schedules.push({
+                    id, type, scheduledFor: iso,
+                    workdayDate: todayStr,
+                    calcVersion: this._calcVersion,
+                    fired: false
+                });
+                this._arm(id, type, iso, todayStr);
+            };
+
+            // ── Helper: converte minutos-desde-meia-noite em ISO do dia atual ─
+            const now      = new Date();
+            const datePfx  = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+            const minToIso = min => {
+                const n = ((Math.round(min) % 1440) + 1440) % 1440;
+                return `${datePfx}T${String(Math.floor(n / 60)).padStart(2, '0')}:${String(n % 60).padStart(2, '0')}:00`;
+            };
+            const isFuture = iso => new Date(iso).getTime() > Date.now();
+
+            // ── Workday frozen: cancelar TODAS as notificações de saída ──────
+            if (frozen) {
+                const data = this.load();
+                const EXIT_TYPES = [
+                    'EXPECTED_EXIT_H6', 'EXPECTED_EXIT_H8',
+                    'EXPECTED_EXIT_H10', 'EXPECTED_EXIT_IDEAL',
+                    'ENTRY_REMINDER'
+                ];
+                let changed = false;
+                EXIT_TYPES.forEach(type => {
+                    const before = data.schedules.length;
+                    data.schedules = data.schedules.filter(
+                        s => !(s.type === type && s.workdayDate === todayStr)
+                    );
+                    if (data.schedules.length !== before) {
+                        // limpar timers em memória
+                        [...this._timers.keys()]
+                            .filter(id => id.startsWith(type))
+                            .forEach(id => { clearTimeout(this._timers.get(id)); this._timers.delete(id); });
+                        changed = true;
+                    }
+                });
+                if (changed) this.save(data);
+                return;
+            }
+
+            // ── Batch único: load → modificar → save ────────────────────────
+            const data = this.load();
+            this._calcVersion++;
+            let changed = false;
+
+            // 1. Lembretes de entrada (só se entrada ainda não foi batida)
+            const temEntrada = ctx.workday?.entries?.some(e => e.type === 'WORK_START');
+            if (!temEntrada) {
+                const entradaMin = hmToMin(CONFIG.NOTIFICACOES.HORARIO_ENTRADA_PADRAO);
+                CONFIG.NOTIFICACOES.entrada.forEach(antecipMin => {
+                    const iso = minToIso(entradaMin - antecipMin);
+                    if (!isFuture(iso)) return;
+                    upsert(data, `ENTRY_REMINDER-${antecipMin}-${todayStr}`, 'ENTRY_REMINDER', iso);
+                    changed = true;
+                });
+            }
+
+            // 2. Saídas previstas
+            const saidas = jornadaHoje.saidas;
+            [
+                { type: 'EXPECTED_EXIT_H6',    min: saidas.h6 },
+                { type: 'EXPECTED_EXIT_H8',    min: saidas.h8 },
+                { type: 'EXPECTED_EXIT_H10',   min: saidas.h10 },
+                { type: 'EXPECTED_EXIT_IDEAL', min: saidas.saidaIdeal }
+            ].forEach(({ type, min }) => {
+                if (min === null || min === undefined) return;
+                const iso = minToIso(min);
+                if (!isFuture(iso)) return;
+                upsert(data, `${type}-${todayStr}`, type, iso);
+                changed = true;
+            });
+
+            if (changed) this.save(data);
+        }
     };
 
     /* =========================================================
@@ -72,7 +622,8 @@
             if (!s) return null;
             s = String(s).trim();
             const neg = s.startsWith('-');
-            const [h, m] = s.replace(/[^0-9:]/g, '').split(':').map(Number);
+            const clean = s.replace(/[^0-9:]/g, '');
+            const [h, m] = clean.split(':').map(Number);
             if (isNaN(h)) return null;
             return neg ? -(h * 60 + (m || 0)) : h * 60 + (m || 0);
         },
@@ -100,10 +651,6 @@
         nowMin() {
             const d = new Date();
             return d.getHours() * 60 + d.getMinutes();
-        },
-
-        now() {
-            return new Date();
         }
     };
 
@@ -203,22 +750,28 @@
             return { ano: hoje.getFullYear(), mes: hoje.getMonth() };
         },
 
+        // Nomes de meses normalizados (sem acentos, minúsculos) — gerado uma vez
+        _MESES_NORM: null,
+
+        _getMesesNorm() {
+            if (!this._MESES_NORM) {
+                this._MESES_NORM = this.MESES.map(m =>
+                    m.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+                );
+            }
+            return this._MESES_NORM;
+        },
+
         // Extrai { ano, mes } de textos como "Junho/2026" ou "junho de 2026"
         _parsePeriodoTexto(texto) {
             if (!texto) return null;
             const anoMatch = texto.match(/\d{4}/);
             if (!anoMatch) return null;
             const ano   = parseInt(anoMatch[0], 10);
-            const lower = texto.toLowerCase()
-                .normalize('NFD')
-                .replace(/[\u0300-\u036f]/g, '');
-            const nomes = this.MESES.map(m =>
-                m.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '')
-            );
+            const lower = texto.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+            const nomes = this._getMesesNorm();
             for (let i = 0; i < nomes.length; i++) {
-                if (lower.includes(nomes[i].slice(0, 3))) {
-                    return { ano, mes: i };
-                }
+                if (lower.includes(nomes[i].slice(0, 3))) return { ano, mes: i };
             }
             return null;
         },
@@ -269,17 +822,16 @@
             }
 
             if (batidas.length >= 2) {
+                // Duas ou mais batidas: pode calcular h8/h10 a partir do 2º turno
                 const e1 = Hora.toMin(batidas[0]);
                 const s1 = Hora.toMin(batidas[1]);
                 const t1 = s1 - e1;
                 const e2 = batidas[2] ? Hora.toMin(batidas[2]) : Hora.nowMin();
                 h8  = e2 + (CONFIG.CARGA_DIARIA  - t1);
                 h10 = e2 + (CONFIG.MAX_HORAS_DIA - t1);
-            } else if (batidas.length >= 1) {
-                const e1 = Hora.toMin(batidas[0]);
-                h8  = e1 + CONFIG.CARGA_DIARIA;
-                h10 = e1 + CONFIG.MAX_HORAS_DIA;
             }
+            // Com apenas 1 batida o turno máximo é 6h, por isso h8/h10 não se aplicam:
+            // o usuário precisa primeiro registrar o intervalo antes de poder completar 8h.
 
             const saidaIdeal = h8 !== null ? h8 - saldoSemana : null;
             return { h6, h8, h10, saidaIdeal };
@@ -423,43 +975,34 @@
 
         gerarMensal(dias, periodo) {
             const hoje = new Date();
-            // periodo pode vir do calendário visível ou ser o mês atual
             const p = periodo || DataHelper.getPeriodoObj(hoje.getFullYear(), hoje.getMonth());
 
-            const diasFuturos  = dias.filter(x => x.isFuture && x.isBusinessDay);
-            const diaHoje      = dias.find(x => x.isToday) || null;
+            const diasFuturos = dias.filter(x => x.isFuture && x.isBusinessDay);
 
-            // Saldo semanal sem hoje — usado para cálculo de saída ideal
-            // Aplica tolerância: dias dentro de ±TOLERANCIA contribuem com zero
-            const saldoSemana = dias
-                .filter(x => DataHelper.sameWeek(x.data, hoje) && !x.isFuture && !x.isToday && x.isBusinessDay)
-                .reduce((a, b) => {
-                    const saldoBruto   = b.saldo;
-                    const efetivo      = (b.batidas.length > 0 && Math.abs(saldoBruto) <= CONFIG.TOLERANCIA)
-                        ? 0 : saldoBruto;
-                    return a + efetivo;
-                }, 0);
+            // Saldo semanal — reutiliza helper para evitar duplicação
+            const _saldoEfetivo = d => {
+                const bruto = d.saldo;
+                return (d.batidas.length > 0 && Math.abs(bruto) <= CONFIG.TOLERANCIA) ? 0 : bruto;
+            };
 
-            // Saldo semanal com hoje — exibição no painel (também com tolerância)
-            const saldoSemanaComHoje = dias
-                .filter(x => DataHelper.sameWeek(x.data, hoje) && !x.isFuture && x.isBusinessDay)
-                .reduce((a, b) => {
-                    const saldoBruto   = b.saldo;
-                    const efetivo      = (b.batidas.length > 0 && Math.abs(saldoBruto) <= CONFIG.TOLERANCIA)
-                        ? 0 : saldoBruto;
-                    return a + efetivo;
-                }, 0);
+            const diasDaSemana = dias.filter(x =>
+                DataHelper.sameWeek(x.data, hoje) && !x.isFuture && x.isBusinessDay
+            );
+            const saldoSemana = diasDaSemana
+                .filter(x => !x.isToday)
+                .reduce((a, d) => a + _saldoEfetivo(d), 0);
+            const saldoSemanaComHoje = diasDaSemana
+                .reduce((a, d) => a + _saldoEfetivo(d), 0);
 
-            // Filtra apenas os dias do período selecionado
             const diasDoPeriodo = dias.filter(x =>
-                x.data.getFullYear() === p.ano &&
-                x.data.getMonth()    === p.mes
+                x.data.getFullYear() === p.ano && x.data.getMonth() === p.mes
             );
 
             const registros = this.gerarRegistros(diasDoPeriodo);
             const semanas   = this.montarSemanas(registros);
             const resumo    = this.montarResumo(registros, diasFuturos.length, saldoSemanaComHoje, p);
 
+            const diaHoje = dias.find(x => x.isToday) || null;
             return { registros, semanas, resumo, periodo: p, saldoSemana, saldoSemanaComHoje, diaHoje };
         },
 
@@ -534,17 +1077,16 @@
         },
 
         montarResumo(registros, diasFuturos, saldoSemana, periodo) {
-            const comBatidas = registros.filter(x => x.batidas.length > 0);
-            const uteis      = registros.filter(x => x.isBusinessDay);
-            const fds        = registros.filter(x => x.isWeekend && x.batidas.length > 0);
-            // totalMes e saldoMes usam saldoEfetivo
-            const totalMes   = registros.filter(x => x.isBusinessDay).reduce((a, b) => a + b.trabalhado, 0);
-            const saldoMes   = uteis.reduce((a, b) => a + b.saldoEfetivo, 0);
-            const media      = comBatidas.length > 0 ? totalMes / comBatidas.length : 0;
-            const trabalhos  = comBatidas.map(x => x.trabalhado);
-            const maior      = trabalhos.length ? Math.max(...trabalhos) : 0;
-            const menor      = trabalhos.length ? Math.min(...trabalhos) : 0;
-            const p          = periodo || DataHelper.getPeriodo();
+            const comBatidas  = registros.filter(x => x.batidas.length > 0);
+            const uteis       = registros.filter(x => x.isBusinessDay);
+            const fds         = registros.filter(x => x.isWeekend && x.batidas.length > 0);
+            const totalMes    = uteis.reduce((a, b) => a + b.trabalhado, 0);
+            const saldoMes    = uteis.reduce((a, b) => a + b.saldoEfetivo, 0);
+            const media       = comBatidas.length > 0 ? totalMes / comBatidas.length : 0;
+            const trabalhos   = comBatidas.map(x => x.trabalhado);
+            const maior       = trabalhos.length ? Math.max(...trabalhos) : 0;
+            const menor       = trabalhos.length ? Math.min(...trabalhos) : 0;
+            const p           = periodo || DataHelper.getPeriodo();
 
             return {
                 periodo:         p,
@@ -756,6 +1298,7 @@
                     ${this.renderMensal(ctx)}
                     ${Template.divisor()}
                     ${this.renderRelatorios(ctx)}
+                    ${CONFIG.DEBUG_NOTIF ? `${Template.divisor()}${this.renderDebugNotif(ctx)}` : ''}
                 </div>
                 ${Template.rodape(Hora.fmtHour(Hora.nowMin()), STATE.nextRefresh, CONFIG.VERSAO)}
             `;
@@ -763,12 +1306,71 @@
 
         renderStatus(ctx) {
             const { jornadaHoje } = ctx;
+            const encerrado = jornadaHoje.estado.codigo === 'ENCERRADO';
+            const expandido = encerrado && STATE.statusExpandido;
+
             const alertaHtml = jornadaHoje.alerta
                 ? Template.linha('Alerta', `<span class="a-val neg">${jornadaHoje.alerta}</span>`, 'danger')
                 : '';
+
+            // Linha de situação: quando encerrado, vira clicável e mostra seta
+            const seta = expandido ? '▾' : '▸';
+            const situacaoHtml = encerrado
+                ? `<div class="a-row infos clickable" id="ahg-status-toggle" style="user-select:none;">
+                       <span class="a-lbl">Situação</span>
+                       <span class="a-val neu" style="display:flex;align-items:center;gap:5px;">
+                           ${jornadaHoje.estado.label}
+                           <span style="font-size:16px;line-height:1;">${seta}</span>
+                       </span>
+                   </div>`
+                : Template.linha('Situação', `<span class="a-val neu">${jornadaHoje.estado.label}</span>`, 'infos');
+
+            // Detalhe expandido dos turnos
+            let detalheHtml = '';
+            if (expandido) {
+                const { turno1, turno2 } = jornadaHoje;
+                const actualExit = jornadaHoje.saidas?.actualExit;
+
+                const linhaT1 = turno1
+                    ? `<div class="a-status-detalhe-linha">
+                           <span>1º turno</span>
+                           <span>${turno1.entrada} → ${turno1.saida ?? '--:--'}</span>
+                           <span class="a-val neu" style="font-size:13px;">${Hora.fmtMin(turno1.total)}</span>
+                       </div>`
+                    : '';
+
+                // Intervalo
+                const linhaIntervalo = (turno1?.saida && turno2?.entrada)
+                    ? (() => {
+                        const intervMin = Hora.toMin(turno2.entrada) - Hora.toMin(turno1.saida);
+                        return `<div class="a-status-detalhe-linha a-status-detalhe-linha--intervalo">
+                                    <span>Intervalo</span>
+                                    <span>${turno1.saida} → ${turno2.entrada}</span>
+                                    <span style="font-size:13px;color:#555880;">${Hora.fmtMin(intervMin)}</span>
+                                </div>`;
+                    })()
+                    : '';
+
+                const linhaT2 = turno2
+                    ? `<div class="a-status-detalhe-linha">
+                           <span>2º turno</span>
+                           <span>${turno2.entrada} → ${actualExit ?? turno2.saida ?? '--:--'}</span>
+                           <span class="a-val neu" style="font-size:13px;">${Hora.fmtMin(turno2.total)}</span>
+                       </div>`
+                    : '';
+
+                detalheHtml = `
+                    <div class="a-status-detalhe" id="ahg-status-detalhe">
+                        ${linhaT1}
+                        ${linhaIntervalo}
+                        ${linhaT2}
+                    </div>`;
+            }
+
             return `
                 ${Template.secao('Status atual')}
-                ${Template.linha('Situação', `<span class="a-val neu">${jornadaHoje.estado.label}</span>`, 'infos')}
+                ${situacaoHtml}
+                ${detalheHtml}
                 ${alertaHtml}
             `;
         },
@@ -793,12 +1395,22 @@
         renderSaidas(ctx) {
             const { jornadaHoje } = ctx;
             const s = jornadaHoje.saidas;
+
+            // Cada linha só aparece quando o valor existe
+            const linha6    = s.h6        !== null ? Template.linha('⚠️ 6h (limite turno)', `<span class="a-val warn">${Hora.fmtHour(s.h6)}</span>`,        'warn')   : '';
+            const linha8    = s.h8        !== null ? Template.linha('✅ 8h (meta diária)',  `<span class="a-val pos">${Hora.fmtHour(s.h8)}</span>`,          'ok')     : '';
+            const linha10   = s.h10       !== null ? Template.linha('⛔️ 10h (limite dia)', `<span class="a-val neg">${Hora.fmtHour(s.h10)}</span>`,         'danger') : '';
+            const linhaIdeal = s.saidaIdeal !== null ? Template.linha('🏆 Saída ideal',      `<span class="a-val neu">${Hora.fmtHour(s.saidaIdeal)}</span>`, 'infos')  : '';
+
+            // Nada a mostrar (ex: workday encerrado)
+            if (!linha6 && !linha8 && !linha10 && !linhaIdeal) return '';
+
             return `
                 ${Template.secao('Saídas previstas')}
-                ${Template.linha('⚠️ 6h (limite turno)',  `<span class="a-val warn">${Hora.fmtHour(s.h6)}</span>`,         'warn')}
-                ${Template.linha('✅ 8h (meta diária)',   `<span class="a-val pos">${Hora.fmtHour(s.h8)}</span>`,          'ok')}
-                ${Template.linha('⛔️ 10h (limite dia)',  `<span class="a-val neg">${Hora.fmtHour(s.h10)}</span>`,         'danger')}
-                ${Template.linha('🏆 Saída ideal',        `<span class="a-val neu">${Hora.fmtHour(s.saidaIdeal)}</span>`,  'infos')}
+                ${linha6}
+                ${linha8}
+                ${linha10}
+                ${linhaIdeal}
             `;
         },
 
@@ -883,11 +1495,35 @@
             </div>`;
         },
 
+        renderDebugNotif(ctx) {
+            const seta = STATE.menuDebug ? '▼' : '▶';
+            return `
+            <div class="a-menu">
+                <div class="a-row warn clickable a-menu-toggle" id="ahg-debug-toggle" style="border-color:#886600;">
+                    ${Template.label(`${seta} 🧪 Testes de notificação`)}
+                </div>
+                <div class="a-menu-body" id="ahg-debug-body" style="display:${STATE.menuDebug ? 'flex' : 'none'};flex-direction:column;gap:4px;padding-top:4px;">
+                    ${Template.botao('ahg-dbg-entrada',   'Lembrete entrada',    '⏰')}
+                    ${Template.botao('ahg-dbg-6h',        'Limite turno (6h)',   '⚠️')}
+                    ${Template.botao('ahg-dbg-8h',        'Meta diária (8h)',    '✅')}
+                    ${Template.botao('ahg-dbg-10h',       'Limite dia (10h)',    '⛔')}
+                    ${Template.botao('ahg-dbg-ideal',     'Saída ideal',         '🏆')}
+                    ${Template.botao('ahg-dbg-missed-8h', 'Perdida — meta 8h',  '📬')}
+                    ${Template.botao('ahg-dbg-urgente',   'Urgente (requer OK)', '🚨')}
+                </div>
+            </div>`;
+        },
+
         registrarEventos(ctx) {
             document.getElementById('ahg-min')?.addEventListener('click', () => {
                 document.getElementById('ahg-panel').style.display = 'none';
                 document.getElementById('ahg-fab').style.display = 'flex';
                 STATE.panelMinimized = true;
+            });
+
+            document.getElementById('ahg-status-toggle')?.addEventListener('click', () => {
+                STATE.statusExpandido = !STATE.statusExpandido;
+                render();
             });
 
             document.getElementById('ahg-relatorios-toggle')?.addEventListener('click', () => {
@@ -940,6 +1576,45 @@
                     0
                 );
             });
+
+            // ── Painel de debug (só registra se DEBUG_NOTIF estiver ativo) ──
+            if (CONFIG.DEBUG_NOTIF) {
+                document.getElementById('ahg-debug-toggle')?.addEventListener('click', () => {
+                    STATE.menuDebug = !STATE.menuDebug;
+                    const body   = document.getElementById('ahg-debug-body');
+                    const toggle = document.getElementById('ahg-debug-toggle');
+                    if (body)   body.style.display = STATE.menuDebug ? 'flex' : 'none';
+                    if (toggle) {
+                        const lbl  = toggle.querySelector('.a-lbl');
+                        if (lbl) lbl.textContent = `${STATE.menuDebug ? '▼' : '▶'} 🧪 Testes de notificação`;
+                    }
+                });
+
+                const dbgNotif = (id, title, body, urgente = false) =>
+                    notif(`dbg-${id}-${Date.now()}`, title, body, urgente, 0);
+
+                document.getElementById('ahg-dbg-entrada')?.addEventListener('click', () =>
+                    dbgNotif('entrada', '⏰ Hora de bater ponto!', 'Lembre de registrar sua entrada.', true));
+
+                document.getElementById('ahg-dbg-6h')?.addEventListener('click', () =>
+                    dbgNotif('6h', '⚠️ Limite de turno', 'Você atingiu 6h de turno.', true));
+
+                document.getElementById('ahg-dbg-8h')?.addEventListener('click', () =>
+                    dbgNotif('8h', '✅ Meta diária', 'Você completou as 8h.', false));
+
+                document.getElementById('ahg-dbg-10h')?.addEventListener('click', () =>
+                    dbgNotif('10h', '⛔ Limite diário', 'Atenção: 10h atingidas.', true));
+
+                document.getElementById('ahg-dbg-ideal')?.addEventListener('click', () =>
+                    dbgNotif('ideal', '🏆 Saída ideal', 'Saldo semanal compensado.', false));
+
+                document.getElementById('ahg-dbg-missed-8h')?.addEventListener('click', () =>
+                    dbgNotif('missed-8h', '⚠️ Você já deveria ter saído',
+                        'Meta de 8h era às 18:00. Bata o ponto agora se ainda está trabalhando.', true));
+
+                document.getElementById('ahg-dbg-urgente')?.addEventListener('click', () =>
+                    dbgNotif('urgente', '🚨 Notificação urgente', 'Esta notificação requer confirmação do usuário.', true));
+            }
         }
     };
 
@@ -957,16 +1632,33 @@
             dias.forEach(d => {
                 d.elemento?.querySelector('.ahg-total-dia')?.remove();
 
-                const exibir = !d.isToday
-                    && !d.isFuture
-                    && d.batidas.length > 0
-                    && d.batidas.length % 2 === 0;
+                const temBatidas = d.batidas.length > 0;
+                if (!temBatidas || d.isFuture) return;
 
-                if (!exibir) return;
+                const fechado = d.batidas.length % 2 === 0; // todos os turnos têm par
+                const aberto  = !fechado;                   // último turno ainda em aberto
+
+                // Para dias passados com turno em aberto: exibe só o que foi
+                // efetivamente trabalhado (turnos fechados), sem contar o relógio atual.
+                // Para hoje em aberto: usa d.trabalhado normalmente (já inclui o turno corrente via nowMin).
+                let minutosExibir;
+                if (aberto && !d.isToday) {
+                    // Soma apenas os turnos completos (pares de batidas)
+                    let somaFechados = 0;
+                    for (let i = 0; i + 1 < d.batidas.length; i += 2) {
+                        const e = Hora.toMin(d.batidas[i]);
+                        const s = Hora.toMin(d.batidas[i + 1]);
+                        if (e !== null && s !== null) somaFechados += s - e;
+                    }
+                    minutosExibir = somaFechados;
+                } else {
+                    minutosExibir = d.trabalhado;
+                }
 
                 const el = document.createElement('div');
-                el.className   = 'ahg-total-dia';
-                el.textContent = Hora.fmtMin(d.trabalhado);
+                el.className   = aberto ? 'ahg-total-dia ahg-total-dia--aberto' : 'ahg-total-dia';
+                el.textContent = Hora.fmtMin(minutosExibir);
+                if (aberto) el.title = 'Turno em aberto — total parcial';
                 d.elemento.appendChild(el);
             });
         }
@@ -1075,9 +1767,15 @@
 
     /* =========================================================
        Notificações
+       Usa GM_notification (via extensão Tampermonkey) quando disponível —
+       funciona mesmo com a aba em segundo plano ou minimizada.
+       Fallback para Notification API nativa do browser.
+       Nenhuma das duas funciona com o browser completamente fechado.
     ========================================================= */
 
     async function pedirNotif() {
+        // GM_notification não precisa de permissão explícita do usuário,
+        // mas a Notification API precisa. Pedimos para cobrir o fallback.
         if ('Notification' in window && Notification.permission === 'default') {
             await Notification.requestPermission().catch(() => {});
         }
@@ -1089,7 +1787,8 @@
         if (ultima && (agora - ultima) < ttlMs) return;
         STATE.notificationsFired.set(id, agora);
 
-        // Dentro de um iframe, delega para a top window via postMessage
+        // Dentro do iframe, delega para a top window via postMessage
+        // (o script roda em mirror.app.ahgora.com.br; a top window ouve e dispara)
         if (window.top !== window) {
             try {
                 window.top.postMessage(
@@ -1102,20 +1801,34 @@
             return;
         }
 
-        if (!('Notification' in window) || Notification.permission !== 'granted') return;
+        const url = (typeof DOM !== 'undefined') ? DOM.getBatidaUrl() : null;
+        const bodyFull = url ? `${body}\nClique para registrar o ponto.` : body;
 
-        try {
-            const url = DOM.getBatidaUrl();
-            const n = new Notification(title, {
-                body: url ? `${body}\nClique para registrar o ponto.` : body,
-                requireInteraction: urgente,
-                tag: `${id}-${agora}`
+        // ── GM_notification (preferido) ──────────────────────────────────
+        // Funciona mesmo com aba minimizada ou em segundo plano.
+        // Requer @grant GM_notification no cabeçalho do script.
+        if (typeof GM_notification === 'function') {
+            GM_notification({
+                title,
+                text:       bodyFull,
+                timeout:    urgente ? 0 : 8000,  // 0 = não fecha automaticamente
+                onclick:    url ? () => window.open(url, '_blank', 'noopener') : undefined,
+                ondone:     undefined
             });
-            if (url) {
-                n.onclick = () => { window.open(url, '_blank', 'noopener'); n.close(); };
-            }
+            return;
+        }
+
+        // ── Fallback: Notification API nativa ────────────────────────────
+        if (!('Notification' in window) || Notification.permission !== 'granted') return;
+        try {
+            const n = new Notification(title, {
+                body:               bodyFull,
+                requireInteraction: urgente,
+                tag:                `${id}-${agora}`
+            });
+            if (url) n.onclick = () => { window.open(url, '_blank', 'noopener'); n.close(); };
         } catch (e) {
-            console.error(e);
+            console.error('[AHGORA PANEL] Notification falhou:', e);
         }
     }
 
@@ -1123,6 +1836,12 @@
         const { jornadaHoje } = ctx;
         const saidas = jornadaHoje.saidas;
         const now    = Hora.nowMin();
+        const frozen = ctx.frozen || false;
+        const todayStr = todayDateStr();
+
+        // Atualiza agendamento persistente (cancela tudo se frozen)
+        NotifScheduler.updateFromContext(ctx, todayStr);
+        if (frozen) return;
 
         const chk = (h, id, tit, msg, urgente) => {
             if (h === null) return;
@@ -1136,17 +1855,14 @@
             });
 
             if (faltam === 0) {
-                const chave = `${id}-atingido-${new Date().toISOString().slice(0, 16)}`;
-                notif(chave, `✅ ${tit}`, msg, urgente, 0);
+                notif(`${id}-atingido-${new Date().toISOString().slice(0, 16)}`,
+                      `✅ ${tit}`, msg, urgente, 0);
             }
         };
 
-        chk(saidas.h6,         'h6',    '6h atingidas',    'Você completou o mínimo de 6h.', true);
-        chk(saidas.h8,         'h8',    'Meta diária',      'Você completou as 8h.',          false);
-        chk(saidas.h10,        'h10',   'Limite diário',    '⚠ Limite diário atingido.',      true);
-
-        // Notifica saída ideal apenas quando ela difere da meta de 8h
-        // (se forem iguais, a notificação de h8 já cobre)
+        chk(saidas.h6,        'h6',    '6h atingidas', 'Você completou o mínimo de 6h.', true);
+        chk(saidas.h8,        'h8',    'Meta diária',   'Você completou as 8h.',          false);
+        chk(saidas.h10,       'h10',   'Limite diário', '⚠ Limite diário atingido.',      true);
         if (saidas.saidaIdeal !== null && saidas.saidaIdeal !== saidas.h8) {
             chk(saidas.saidaIdeal, 'ideal', 'Saída ideal', 'Saldo semanal compensado.', false);
         }
@@ -1222,6 +1938,32 @@
             font-size:14px;font-weight:700;color:#78788f;
             padding:1px 4px;border-radius:6px;pointer-events:none;
         }
+        .ahg-total-dia--aberto{
+            color:#b9a9ff;
+            opacity:0.75;
+        }
+        .ahg-total-dia--aberto::after{
+            content:'…';
+            font-size:10px;
+            margin-left:1px;
+            opacity:0.8;
+        }
+        .a-status-detalhe{
+            display:flex;flex-direction:column;gap:3px;
+            margin:2px 0 3px;padding:6px 8px;
+            background:rgba(100,100,255,.06);
+            border-left:3px solid #7878ff;
+            border-radius:0 7px 7px 0;
+        }
+        .a-status-detalhe-linha{
+            display:grid;
+            grid-template-columns:80px 1fr auto;
+            align-items:center;gap:4px;
+            font-size:11.5px;color:#9090bb;
+        }
+        .a-status-detalhe-linha--intervalo{
+            opacity:0.6;font-style:italic;
+        }
         `;
         document.head.appendChild(style);
     }
@@ -1274,8 +2016,7 @@
     function agendarRenderMinuto() {
         const agora = new Date();
         const msAte = (60 - agora.getSeconds()) * 1000 - agora.getMilliseconds();
-
-        setTimeout(() => {
+        STATE._renderTimer = setTimeout(() => {
             if (document.visibilityState === 'visible') render();
             agendarRenderMinuto();
         }, msAte);
@@ -1295,67 +2036,95 @@
             const ehMesAtual   = periodoVisivel.ano === periodoAtual.ano
                               && periodoVisivel.mes === periodoAtual.mes;
 
-            // Dias do período visível: usados para relatório, CSV, modal e calendário
             const dias = DOM.extrairDias(periodoVisivel);
 
-            // Dia de hoje: quando estamos no mês atual, está em `dias` (v-present)
-            // Quando estamos em mês diferente, buscamos o v-present diretamente do DOM
-            // sem depender do período — o v-present sempre aponta para hoje
+            // ── Localizar o dia de hoje ──────────────────────────────────────
             let diaHoje = dias.find(x => x.isToday) || null;
+            let domBatidas;
 
             if (!diaHoje) {
-                // DOM tem o mês histórico; v-present não aparece nesses dias.
-                // Lemos o v-present diretamente, construindo um objeto mínimo a partir do DOM.
+                // Mês histórico: v-present aponta para hoje mas não está em `dias`
                 const elHoje = document.querySelector('.v-calendar-weekly__day.v-present');
-                if (elHoje) {
-                    const labelHoje = elHoje.querySelector('.v-calendar-weekly__day-label');
-                    const numHoje   = labelHoje ? Number(labelHoje.textContent.trim()) : 0;
-                    if (numHoje) {
-                        const dataHoje = new Date(periodoAtual.ano, periodoAtual.mes, numHoje);
-                        const batidas  = [...elHoje.querySelectorAll('.batida')]
-                            .filter(x => !x.classList.contains('prevista'))
-                            .map(x => x.textContent.trim());
-                        const trabalhado    = batidas.length > 0 ? Jornada.calcularTrabalhado(batidas) : 0;
-                        const isBusinessDay = dataHoje.getDay() !== 0 && dataHoje.getDay() !== 6;
-                        diaHoje = {
-                            elemento:    elHoje,
-                            data:        dataHoje,
-                            isToday:     true,
-                            isFuture:    false,
-                            isHoliday:   false,
-                            isBusinessDay,
-                            isWeekend:   DataHelper.isWeekend(dataHoje),
-                            semana:      DataHelper.getWeekNumber(dataHoje),
-                            diaSemana:   DataHelper.DIAS_SEMANA[dataHoje.getDay()],
-                            batidas,
-                            trabalhado,
-                            saldo:       isBusinessDay ? trabalhado - CONFIG.CARGA_DIARIA : 0
-                        };
-                    }
-                }
+                if (!elHoje) return; // calendário ainda não carregou
+
+                const labelHoje = elHoje.querySelector('.v-calendar-weekly__day-label');
+                const numHoje   = labelHoje ? Number(labelHoje.textContent.trim()) : 0;
+                if (!numHoje) return;
+
+                domBatidas = [...elHoje.querySelectorAll('.batida')]
+                    .filter(x => !x.classList.contains('prevista'))
+                    .map(x => x.textContent.trim());
+
+                const dataHoje      = new Date(periodoAtual.ano, periodoAtual.mes, numHoje);
+                const isBusinessDay = dataHoje.getDay() !== 0 && dataHoje.getDay() !== 6;
+                // Stub mínimo para _applyEventEngine abaixo
+                diaHoje = {
+                    elemento:    elHoje,
+                    data:        dataHoje,
+                    isToday:     true,
+                    isFuture:    false,
+                    isHoliday:   false,
+                    isBusinessDay,
+                    isWeekend:   DataHelper.isWeekend(dataHoje),
+                    semana:      DataHelper.getWeekNumber(dataHoje),
+                    diaSemana:   DataHelper.DIAS_SEMANA[dataHoje.getDay()],
+                    batidas:     domBatidas,
+                    trabalhado:  0,
+                    saldo:       0
+                };
+            } else {
+                domBatidas = diaHoje.batidas;
             }
 
-            if (!diaHoje) return; // calendário ainda não carregou
+            // ── EventEngine: fonte única de verdade para batidas de hoje ─────
+            const workday            = WorkdayStore.syncFromDom(domBatidas);
+            const { effectiveBatidas, actual, frozen } = EventEngine.resolve(workday, domBatidas);
+            const trabalhado         = effectiveBatidas.length > 0
+                ? Jornada.calcularTrabalhado(effectiveBatidas) : 0;
+            const saldoEfetivoBruto  = diaHoje.isBusinessDay ? trabalhado - CONFIG.CARGA_DIARIA : 0;
+            const emTolerancia       = diaHoje.isBusinessDay
+                && effectiveBatidas.length > 0
+                && Math.abs(saldoEfetivoBruto) <= CONFIG.TOLERANCIA;
 
+            diaHoje = Object.assign({}, diaHoje, {
+                batidas:      effectiveBatidas,
+                trabalhado,
+                saldo:        saldoEfetivoBruto,
+                saldoEfetivo: emTolerancia ? 0 : saldoEfetivoBruto,
+                frozen,
+                actual,
+                workday
+            });
+
+            // ── Relatório mensal ─────────────────────────────────────────────
             const relatorio = Relatorio.gerarMensal(dias, periodo);
 
-            // Saldo semanal para cálculo de saída ideal: sempre do mês atual
             let saldoSemanaJornada = relatorio.saldoSemana;
-            if (!ehMesAtual) {
-                // Recalcula saldo semanal a partir dos dias do mês atual
-                // Nota: quando o calendário está em outro mês, o DOM não tem os dias atuais
-                // então o saldo semanal fica 0 — a saída ideal usa apenas a jornada base
-                saldoSemanaJornada = 0;
-            }
+            if (!ehMesAtual) saldoSemanaJornada = 0;
 
+            // ── RuleEngine ───────────────────────────────────────────────────
+            STATE.ruleResults = RuleEngine.evaluate(diaHoje.batidas, diaHoje.trabalhado);
+
+            // ── Jornada ──────────────────────────────────────────────────────
             const jornadaHoje = Jornada.calcularDia(diaHoje, saldoSemanaJornada);
+
+            if (frozen) {
+                jornadaHoje.saidas = {
+                    h6: null, h8: null, h10: null, saidaIdeal: null,
+                    actualExit: actual['WORK_END']?.time || null
+                };
+                jornadaHoje.estado = { codigo: 'ENCERRADO', label: '🛫 Encerrado' };
+            }
 
             const ctx = {
                 dias,
                 periodo,
                 relatorio,
                 resumo:      relatorio.resumo,
-                jornadaHoje
+                jornadaHoje,
+                frozen,
+                ruleResults: STATE.ruleResults,
+                workday
             };
 
             checarNotifs(ctx);
@@ -1378,8 +2147,18 @@
     function start() {
         injectCSS();
         criarEstrutura();
+
+        // Housekeeping on startup
+        WorkdayStore.pruneOld(35);
+        NotifScheduler.recover(todayDateStr());
         render();
         agendarRenderMinuto();
+
+        // Quando a aba volta ao foco: re-verifica imediatamente
+        // (cobre o caso de notificações perdidas enquanto a aba estava oculta)
+        document.addEventListener('visibilitychange', () => {
+            if (document.visibilityState === 'visible') render();
+        });
 
         // MutationObserver: recalcula quando o calendário mudar de mês
         const calendario = document.querySelector('.v-calendar-weekly');
@@ -1461,12 +2240,10 @@
     const IS_TOP = window.top === window;
     if (IS_TOP) {
         console.log('[AHGORA PANEL] TOP WINDOW');
-        pedirNotif();
 
-        // Recebe pedidos de notificação vindos do iframe
+        // Recebe pedidos de notificação vindos do iframe e dispara via GM_notification
         window.addEventListener('message', e => {
             if (!e.data || e.data.type !== 'AHG_NOTIF') return;
-
             const { id, title, body, urgente, ttlMs } = e.data;
             notif(id, title, body, urgente, ttlMs ?? 60 * 1000);
         });
@@ -1477,5 +2254,129 @@
         }, CONFIG.AUTO_REFRESH_MIN * 60 * 1000);
         return;
     }
+
+    /* =========================================================
+       Dev helpers — exposed on window for console testing
+       ahgWorkday()          — print today's persisted workday
+       ahgRegisterExit(time) — manually register WORK_END e.g. "17:56"
+       ahgRules()            — print rule evaluation results
+       ahgNotifSchedule()    — print current notification schedule
+       ahgScenarioTest()     — run end-to-end scenario assertions
+    ========================================================= */
+
+    window.ahgWorkday = function () {
+        const wd = WorkdayStore.loadToday();
+        console.table(wd.entries);
+        console.log('[ahgWorkday] status:', wd.status, '| frozen:', wd.entries.some(e => e.type === 'WORK_END'));
+        return wd;
+    };
+
+    window.ahgRegisterExit = function (time) {
+        if (!time || !/^\d{2}:\d{2}$/.test(time)) {
+            console.error('[ahgRegisterExit] format: "HH:MM"');
+            return;
+        }
+        const wd = WorkdayStore.registerManual('WORK_END', time);
+        console.log('[ahgRegisterExit] registered WORK_END:', time, '| status:', wd.status);
+        render();
+    };
+
+    window.ahgRules = function () {
+        const results = STATE.ruleResults || [];
+        console.table(results.map(r => ({
+            rule: r.rule, status: r.status, severity: r.severity,
+            details: JSON.stringify(r.details)
+        })));
+        return results;
+    };
+
+    window.ahgNotifSchedule = function () {
+        const data = NotifScheduler.load();
+        console.table(data.schedules);
+        return data;
+    };
+
+    window.ahgScenarioTest = function () {
+        console.group('[ahgScenarioTest] End-to-end scenario');
+
+        // ── Test 1: WorkdayStore basic persistence ──
+        const ts = 'test-workday';
+        const fakeWd = {
+            schemaVersion: CONFIG.SCHEMA_VERSION,
+            date: ts,
+            entries: [
+                { type: 'WORK_START',  time: '08:03', source: 'DOM',    createdAt: new Date().toISOString() },
+                { type: 'BREAK_START', time: '12:01', source: 'DOM',    createdAt: new Date().toISOString() },
+                { type: 'BREAK_END',   time: '13:02', source: 'DOM',    createdAt: new Date().toISOString() }
+            ],
+            status: 'OPEN'
+        };
+        WorkdayStore.save(fakeWd);
+        const loaded = WorkdayStore.load(ts);
+        console.assert(loaded !== null, 'T1: load after save');
+        console.assert(loaded.entries.length === 3, 'T1: entry count preserved');
+
+        // ── Test 2: MANUAL entry not overwritten by DOM ──
+        WorkdayStore.registerManual('WORK_END', '17:56');
+        // Simulate DOM sync with a different exit time
+        const wdAfterSync = WorkdayStore.load(WorkdayStore._todayStr()) || WorkdayStore.loadToday();
+        // Register on today's store
+        WorkdayStore.registerManual('WORK_END', '17:56');
+        const wdToday = WorkdayStore.loadToday();
+        const exitEntry = wdToday.entries.find(e => e.type === 'WORK_END');
+        console.assert(exitEntry && exitEntry.source === 'MANUAL', 'T2: WORK_END is MANUAL');
+        console.assert(exitEntry && exitEntry.time === '17:56', 'T2: WORK_END time preserved as 17:56');
+        console.assert(wdToday.status === 'COMPLETED', 'T2: status is COMPLETED after exit');
+
+        // ── Test 3: EventEngine frozen flag ──
+        const { frozen } = EventEngine.resolve(wdToday, ['08:03', '12:01', '13:02', '18:00']);
+        console.assert(frozen === true, 'T3: frozen=true when WORK_END is actual');
+        console.log('T3: frozen =', frozen, '(expect: true)');
+
+        // ── Test 4: EventEngine MANUAL override ──
+        const { effectiveBatidas } = EventEngine.resolve(wdToday, ['08:03', '12:01', '13:02', '18:00']);
+        console.assert(effectiveBatidas[3] === '17:56', 'T4: effectiveBatidas[3] is MANUAL 17:56, not DOM 18:00');
+        console.log('T4: effectiveBatidas[3] =', effectiveBatidas[3], '(expect: 17:56)');
+
+        // ── Test 5: Tolerance classification ──
+        const testTolerance = (saldo, expected) => {
+            const withinTolerance = Math.abs(saldo) <= CONFIG.TOLERANCIA;
+            const result = withinTolerance ? 0 : saldo;
+            console.assert(result === expected, `T5: saldo ${saldo} → ${result} (expect ${expected})`);
+        };
+        testTolerance(-11, -11);  // outside → kept
+        testTolerance(-10, 0);    // boundary → zeroed
+        testTolerance(-9,  0);    // inside → zeroed
+        testTolerance( 0,  0);
+        testTolerance( 9,  0);
+        testTolerance( 10, 0);    // boundary → zeroed
+        testTolerance( 11, 11);   // outside → kept
+
+        // ── Test 6: RuleEngine daily limit ──
+        const okResult    = RuleEngine.dailyLimitRule(7 * 60);
+        const warnResult  = RuleEngine.dailyLimitRule(9 * 60);
+        const errResult   = RuleEngine.dailyLimitRule(11 * 60);
+        console.assert(okResult.status   === 'OK',        'T6a: daily limit OK');
+        console.assert(warnResult.status === 'WARNING',   'T6b: daily limit WARNING');
+        console.assert(errResult.status  === 'VIOLATION', 'T6c: daily limit VIOLATION');
+
+        // ── Test 7: RuleEngine shift limit ──
+        const shiftOk   = RuleEngine.shiftLimitRule(['08:00', '13:59']);  // 5h59m
+        const shiftFail = RuleEngine.shiftLimitRule(['08:00', '14:01']);  // 6h01m
+        console.assert(shiftOk.status   === 'OK',        'T7a: shift OK');
+        console.assert(shiftFail.status === 'VIOLATION', 'T7b: shift VIOLATION');
+
+        // ── Test 8: RuleEngine break ──
+        const breakOk   = RuleEngine.breakRule(['08:00', '12:00', '13:00', '17:00']); // 60m
+        const breakFail = RuleEngine.breakRule(['08:00', '12:00', '12:20', '17:00']); // 20m
+        console.assert(breakOk.status   === 'OK',        'T8a: break OK');
+        console.assert(breakFail.status === 'VIOLATION', 'T8b: break VIOLATION');
+
+        // ── Cleanup test key ──
+        localStorage.removeItem(WorkdayStore._keyFor(ts));
+
+        console.log('[ahgScenarioTest] All assertions logged above. Check for any failed ones.');
+        console.groupEnd();
+    };
 
 })();
