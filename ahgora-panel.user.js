@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Ahgora — Painel Inteligente Local
 // @namespace    https://github.com/jonathanfiss
-// @version      2.2.0
+// @version      2.3.0
 // @description  Painel inteligente local para Ahgora
 // @author       Jonathan Fiss
 
@@ -38,7 +38,7 @@
     TOLERANCIA: 10, // minutos — saldo dentro desse intervalo é zerado
     // Sistema
     AUTO_REFRESH_MIN: 15,
-    VERSAO: "2.2.0",
+    VERSAO: "2.3.0",
     SCHEMA_VERSION: 1,
     DEBUG_NOTIF: false, // true → mostra painel de testes de notificação no UI
     // URLs
@@ -105,6 +105,119 @@
     const [h, m] = s.split(":").map(Number);
     return h * 60 + m;
   }
+
+  /* =========================================================
+   ManualPunches — batidas manuais locais (solicitações que
+   não aparecem no espelho). Key: "ahg_manual_punches"
+   { "YYYY-MM-DD": [ { time: "HH:MM", createdAt } ] }
+========================================================= */
+
+  const ManualPunches = {
+    _KEY: "ahg_manual_punches",
+
+    _loadAll() {
+      try {
+        const o = JSON.parse(localStorage.getItem(this._KEY) || "{}");
+        return o && typeof o === "object" ? o : {};
+      } catch {
+        return {};
+      }
+    },
+
+    _saveAll(o) {
+      try {
+        localStorage.setItem(this._KEY, JSON.stringify(o));
+      } catch (e) {
+        console.warn("[ManualPunches] save failed:", e);
+      }
+    },
+
+    dateStr(date) {
+      return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+    },
+
+    timesFor(dateStr) {
+      return (this._loadAll()[dateStr] || []).map((x) => x.time);
+    },
+
+    add(dateStr, time) {
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(dateStr || ""))
+        return { ok: false, erro: "Data inválida." };
+      const m = /^(\d{2}):(\d{2})$/.exec(time || "");
+      if (!m || Number(m[1]) > 23 || Number(m[2]) > 59)
+        return { ok: false, erro: "Horário inválido." };
+
+      const hoje = todayDateStr();
+      if (dateStr > hoje)
+        return {
+          ok: false,
+          erro: "Não é possível inserir batida em data futura.",
+        };
+      if (dateStr === hoje && hmToMin(time) > Hora.nowMin())
+        return { ok: false, erro: "Esse horário ainda não chegou." };
+
+      const all = this._loadAll();
+      const list = all[dateStr] || [];
+      if (list.some((x) => x.time === time))
+        return { ok: false, erro: "Essa batida manual já existe." };
+
+      list.push({ time, createdAt: new Date().toISOString() });
+      list.sort((a, b) => hmToMin(a.time) - hmToMin(b.time));
+      all[dateStr] = list;
+      this._saveAll(all);
+      return { ok: true };
+    },
+
+    remove(dateStr, time) {
+      const all = this._loadAll();
+      if (!all[dateStr]) return false;
+      const antes = all[dateStr].length;
+      all[dateStr] = all[dateStr].filter((x) => x.time !== time);
+      if (!all[dateStr].length) delete all[dateStr];
+      this._saveAll(all);
+      return true;
+    },
+
+    listAll() {
+      const all = this._loadAll();
+      const out = [];
+      Object.keys(all).forEach((date) =>
+        all[date].forEach((x) => out.push({ date, time: x.time })),
+      );
+      return out.sort(
+        (a, b) => b.date.localeCompare(a.date) || b.time.localeCompare(a.time),
+      );
+    },
+
+    prune(days = 400) {
+      const cutoff = new Date();
+      cutoff.setDate(cutoff.getDate() - days);
+      const lim = this.dateStr(cutoff);
+      const all = this._loadAll();
+      let dirty = false;
+      Object.keys(all).forEach((k) => {
+        if (k < lim) {
+          delete all[k];
+          dirty = true;
+        }
+      });
+      if (dirty) this._saveAll(all);
+    },
+
+    // Mescla batidas do espelho + manuais (ordenadas). Se o espelho já
+    // tiver o mesmo horário, a manual é ignorada (sem duplicar).
+    merge(dateStr, domBatidas) {
+      const domMin = domBatidas.map((t) => Hora.toMin(t));
+      const manuais = this.timesFor(dateStr).filter(
+        (t) => !domMin.includes(hmToMin(t)),
+      );
+      if (!manuais.length) return { batidas: domBatidas, manuais: [] };
+      const batidas = [...domBatidas, ...manuais].sort(
+        (a, b) => Hora.toMin(a) - Hora.toMin(b),
+      );
+      return { batidas, manuais };
+    },
+  };
 
   /* =========================================================
        WorkdayStore — persistent workday state (localStorage)
@@ -241,6 +354,22 @@
       const TYPES = ["WORK_START", "BREAK_START", "BREAK_END", "WORK_END"];
       let dirty = false;
 
+      const idxOf = (type) => {
+        const i = TYPES.indexOf(type);
+        if (i >= 0) return i;
+        const m = /^PUNCH_(\d+)$/.exec(type);
+        return m ? Number(m[1]) - 1 : -1;
+      };
+
+      // Remove entradas DOM que não existem mais (ex.: batida manual apagada)
+      const antes = wd.entries.length;
+      wd.entries = wd.entries.filter((e) => {
+        if (e.source !== "DOM") return true;
+        const idx = idxOf(e.type);
+        return idx === -1 ? true : !!batidas[idx];
+      });
+      if (wd.entries.length !== antes) dirty = true;
+
       batidas.forEach((time, idx) => {
         if (!time) return;
         const type = TYPES[idx] || `PUNCH_${idx + 1}`;
@@ -264,6 +393,13 @@
 
       if (wd.entries.length >= 4 && wd.status === "OPEN") {
         wd.status = "COMPLETED";
+        dirty = true;
+      } else if (
+        wd.status === "COMPLETED" &&
+        wd.entries.length < 4 &&
+        !wd.entries.some((e) => e.type === "WORK_END")
+      ) {
+        wd.status = "OPEN"; // reabre o dia se a última batida foi removida
         dirty = true;
       }
 
@@ -1135,7 +1271,6 @@
       const mes = periodo ? periodo.mes : new Date().getMonth();
       const resultado = [];
 
-      // Data de hoje para comparação por data quando v-present não existe
       const hoje = new Date();
       const hojeAno = hoje.getFullYear();
       const hojeMes = hoje.getMonth();
@@ -1156,18 +1291,21 @@
           (x) => x.textContent.trim() === "star",
         );
 
-        // Usa o ano/mês do período ativo, não necessariamente hoje
         const data = new Date(ano, mes, numeroDia);
         const weekDay = data.getDay();
 
-        // isToday: v-present quando no mês atual, ou comparação de data em outros meses
         const isToday =
           isPresentClass ||
           (ano === hojeAno && mes === hojeMes && numeroDia === hojeDia);
 
-        const batidas = [...day.querySelectorAll(".batida")]
+        // Batidas do espelho + batidas manuais locais (mescladas e ordenadas)
+        const domBatidas = [...day.querySelectorAll(".batida")]
           .filter((x) => !x.classList.contains("prevista"))
           .map((x) => x.textContent.trim());
+        const { batidas, manuais } = ManualPunches.merge(
+          ManualPunches.dateStr(data),
+          domBatidas,
+        );
 
         const possuiBatidas = batidas.length > 0;
         const isBusinessDay =
@@ -1188,6 +1326,8 @@
           semana: DataHelper.getWeekNumber(data),
           diaSemana: DataHelper.DIAS_SEMANA[data.getDay()],
           batidas,
+          domBatidas,
+          manuais,
           trabalhado,
           saldo,
         });
@@ -1590,6 +1730,8 @@
                     ${secaoOperacional}
                     ${this.renderMensal(ctx)}
                     ${Template.divisor()}
+                    ${Template.botao("ahg-open-manuais", "Batidas manuais", "✍️")}
+                    ${Template.divisor()}
                     ${this.renderRelatorios(ctx)}
                     ${CONFIG.DEBUG_NOTIF ? `${Template.divisor()}${this.renderDebugNotif(ctx)}` : ""}
                 </div>
@@ -1927,6 +2069,9 @@
             0,
           );
         });
+      document
+        .getElementById("ahg-open-manuais")
+        ?.addEventListener("click", () => ManualModal.abrir());
 
       // ── Painel de debug (só registra se DEBUG_NOTIF estiver ativo) ──
       if (CONFIG.DEBUG_NOTIF) {
@@ -2034,19 +2179,25 @@
     renderTotais(dias) {
       dias.forEach((d) => {
         d.elemento?.querySelector(".ahg-total-dia")?.remove();
+        d.elemento?.querySelector(".ahg-manual-badge")?.remove();
+
+        // Marca de batidas manuais
+        if (d.manuais && d.manuais.length && d.elemento) {
+          const b = document.createElement("div");
+          b.className = "ahg-manual-badge";
+          b.textContent = `✎ ${d.manuais.join(" · ")}`;
+          b.title = `Batidas manuais (locais): ${d.manuais.join(", ")}`;
+          d.elemento.appendChild(b);
+        }
 
         const temBatidas = d.batidas.length > 0;
         if (!temBatidas || d.isFuture) return;
 
-        const fechado = d.batidas.length % 2 === 0; // todos os turnos têm par
-        const aberto = !fechado; // último turno ainda em aberto
+        const fechado = d.batidas.length % 2 === 0;
+        const aberto = !fechado;
 
-        // Para dias passados com turno em aberto: exibe só o que foi
-        // efetivamente trabalhado (turnos fechados), sem contar o relógio atual.
-        // Para hoje em aberto: usa d.trabalhado normalmente (já inclui o turno corrente via nowMin).
         let minutosExibir;
         if (aberto && !d.isToday) {
-          // Soma apenas os turnos completos (pares de batidas)
           let somaFechados = 0;
           for (let i = 0; i + 1 < d.batidas.length; i += 2) {
             const e = Hora.toMin(d.batidas[i]);
@@ -2174,6 +2325,153 @@
       });
 
       return html;
+    },
+  };
+
+  /* =========================================================
+   ManualModal — inserir / apagar batidas manuais
+========================================================= */
+
+  const ManualModal = {
+    _data: null,
+    _msg: null,
+    _confirmando: null,
+
+    abrir() {
+      document.getElementById("ahg-manual-modal")?.remove();
+      this._msg = null;
+      this._confirmando = null;
+      this._data = todayDateStr();
+
+      const overlay = document.createElement("div");
+      overlay.id = "ahg-manual-modal";
+      overlay.style.cssText =
+        "position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:999999;display:flex;align-items:center;justify-content:center;";
+
+      const box = document.createElement("div");
+      box.style.cssText =
+        "width:min(460px,95vw);max-height:90vh;overflow-y:auto;background:#111827;border-radius:14px;padding:20px;color:#dde;font-family:Segoe UI,sans-serif;";
+
+      overlay.appendChild(box);
+      document.body.appendChild(overlay);
+      overlay.onclick = (e) => {
+        if (e.target === overlay) overlay.remove();
+      };
+
+      this._desenhar(box, overlay);
+    },
+
+    _fmtData(d) {
+      return d.split("-").reverse().join("/");
+    },
+
+    _desenhar(box, overlay) {
+      const hoje = todayDateStr();
+
+      // Horários que já aparecem no espelho (mês visível) — para sinalizar duplicidade
+      const noEspelho = new Set();
+      try {
+        DOM.extrairDias(DataHelper.getPeriodoVisivel()).forEach((d) => {
+          const ds = ManualPunches.dateStr(d.data);
+          d.domBatidas.forEach((t) => noEspelho.add(`${ds}|${Hora.toMin(t)}`));
+        });
+      } catch {
+        /* silent */
+      }
+
+      const inputCss =
+        "background:#0f0f1e;color:#dde;border:1px solid #252545;border-radius:6px;padding:6px 8px;font-size:13px;color-scheme:dark;";
+      const btnCss =
+        "background:#3b2d82;color:#fff;border:none;border-radius:6px;padding:7px 12px;cursor:pointer;font-size:13px;";
+
+      const lista = ManualPunches.listAll();
+      const linhas = lista.length
+        ? lista
+            .map((p) => {
+              const key = `${p.date}|${p.time}`;
+              const duplicada = noEspelho.has(
+                `${p.date}|${Hora.toMin(p.time)}`,
+              );
+              const confirmando = this._confirmando === key;
+              return `
+                <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;padding:6px 8px;border-radius:7px;background:rgba(255,255,255,.04);margin-bottom:4px;">
+                    <span>${this._fmtData(p.date)} &nbsp;<strong style="color:#b9a9ff;">${p.time}</strong>
+                        ${duplicada ? '<small style="color:#ffb347;"> · já consta no espelho</small>' : ""}</span>
+                    <button data-del="${key}" style="background:${confirmando ? "#b91c1c" : "#2a2a45"};color:#fff;border:none;border-radius:6px;padding:5px 10px;cursor:pointer;font-size:12px;">
+                        ${confirmando ? "Confirmar?" : "🗑 Apagar"}
+                    </button>
+                </div>`;
+            })
+            .join("")
+        : '<p style="color:#555880;font-size:12px;margin:6px 0;">Nenhuma batida manual registrada.</p>';
+
+      const msgHtml = this._msg
+        ? `<div style="font-size:12px;margin:6px 0 10px;color:${this._msg.ok ? "#3ddc84" : "#ff6b6b"};">${this._msg.txt}</div>`
+        : '<div style="height:10px;"></div>';
+      this._msg = null;
+
+      box.innerHTML = `
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
+                <h2 style="margin:0;font-size:17px;">✍️ Batidas manuais</h2>
+                <button id="ahg-man-close" style="${btnCss}background:#2a2a45;">Fechar</button>
+            </div>
+            <p style="color:#7880aa;font-size:11.5px;margin:0 0 12px;">
+                Use para batidas feitas por solicitação, que não aparecem no espelho.
+                Ficam salvas apenas neste navegador e entram nos cálculos do dia.
+            </p>
+            <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end;">
+                <label style="font-size:11px;color:#7880aa;display:flex;flex-direction:column;gap:3px;">Data
+                    <input id="ahg-man-data" type="date" value="${this._data || hoje}" max="${hoje}" style="${inputCss}">
+                </label>
+                <label style="font-size:11px;color:#7880aa;display:flex;flex-direction:column;gap:3px;">Horário
+                    <input id="ahg-man-hora" type="time" style="${inputCss}">
+                </label>
+                <button id="ahg-man-add" style="${btnCss}">＋ Adicionar</button>
+            </div>
+            ${msgHtml}
+            <div style="font-size:10px;letter-spacing:1px;text-transform:uppercase;color:#444466;margin:4px 0 6px;font-weight:700;">Inseridas manualmente</div>
+            ${linhas}
+        `;
+
+      box.querySelector("#ahg-man-close").onclick = () => overlay.remove();
+
+      box.querySelector("#ahg-man-add").onclick = () => {
+        const data = box.querySelector("#ahg-man-data").value;
+        const hora = box.querySelector("#ahg-man-hora").value;
+        this._data = data || hoje;
+        this._confirmando = null;
+
+        const r = ManualPunches.add(data, hora);
+        this._msg = r.ok
+          ? {
+              ok: true,
+              txt: `Batida ${hora} de ${this._fmtData(data)} adicionada.`,
+            }
+          : { ok: false, txt: r.erro };
+        if (r.ok) render();
+        this._desenhar(box, overlay);
+      };
+
+      // Apagar em duas etapas (sem confirm(), que pode ser bloqueado em iframe)
+      box.querySelectorAll("[data-del]").forEach((btn) => {
+        btn.onclick = () => {
+          const key = btn.dataset.del;
+          if (this._confirmando !== key) {
+            this._confirmando = key;
+            this._desenhar(box, overlay);
+            return;
+          }
+          const [date, time] = key.split("|");
+          ManualPunches.remove(date, time);
+          this._confirmando = null;
+          this._msg = {
+            ok: true,
+            txt: `Batida ${time} de ${this._fmtData(date)} removida.`,
+          };
+          render();
+          this._desenhar(box, overlay);
+        };
+      });
     },
   };
 
@@ -2427,6 +2725,11 @@
         .a-status-detalhe-linha--intervalo{
             opacity:0.6;font-style:italic;
         }
+        .ahg-manual-badge{
+            position:absolute;bottom:2px;left:4px;
+            font-size:10px;font-weight:700;color:#ffb347;
+            padding:1px 4px;border-radius:6px;pointer-events:none;
+        }
         `;
     document.head.appendChild(style);
   }
@@ -2512,9 +2815,10 @@
         const numHoje = labelHoje ? Number(labelHoje.textContent.trim()) : 0;
         if (!numHoje) return;
 
-        domBatidas = [...elHoje.querySelectorAll(".batida")]
+        const domBrutas = [...elHoje.querySelectorAll(".batida")]
           .filter((x) => !x.classList.contains("prevista"))
           .map((x) => x.textContent.trim());
+        domBatidas = ManualPunches.merge(todayDateStr(), domBrutas).batidas;
 
         const dataHoje = new Date(periodoAtual.ano, periodoAtual.mes, numHoje);
         const isBusinessDay =
@@ -2626,6 +2930,7 @@
 
     // Housekeeping on startup
     WorkdayStore.pruneOld(35);
+    ManualPunches.prune(400);
     NotifScheduler.recover(todayDateStr());
     render();
 
@@ -2781,197 +3086,4 @@
     Ticker.start();
     return;
   }
-
-  /* =========================================================
-       Dev helpers — exposed on window for console testing
-       ahgWorkday()          — print today's persisted workday
-       ahgRegisterExit(time) — manually register WORK_END e.g. "17:56"
-       ahgRules()            — print rule evaluation results
-       ahgNotifSchedule()    — print current notification schedule
-       ahgScenarioTest()     — run end-to-end scenario assertions
-    ========================================================= */
-
-  window.ahgWorkday = function () {
-    const wd = WorkdayStore.loadToday();
-    console.table(wd.entries);
-    console.log(
-      "[ahgWorkday] status:",
-      wd.status,
-      "| frozen:",
-      wd.entries.some((e) => e.type === "WORK_END"),
-    );
-    return wd;
-  };
-
-  window.ahgRegisterExit = function (time) {
-    if (!time || !/^\d{2}:\d{2}$/.test(time)) {
-      console.error('[ahgRegisterExit] format: "HH:MM"');
-      return;
-    }
-    const wd = WorkdayStore.registerManual("WORK_END", time);
-    console.log(
-      "[ahgRegisterExit] registered WORK_END:",
-      time,
-      "| status:",
-      wd.status,
-    );
-    render();
-  };
-
-  window.ahgRules = function () {
-    const results = STATE.ruleResults || [];
-    console.table(
-      results.map((r) => ({
-        rule: r.rule,
-        status: r.status,
-        severity: r.severity,
-        details: JSON.stringify(r.details),
-      })),
-    );
-    return results;
-  };
-
-  window.ahgNotifSchedule = function () {
-    const data = NotifScheduler.load();
-    console.table(data.schedules);
-    return data;
-  };
-
-  window.ahgScenarioTest = function () {
-    console.group("[ahgScenarioTest] End-to-end scenario");
-
-    // ── Test 1: WorkdayStore basic persistence ──
-    const ts = "test-workday";
-    const fakeWd = {
-      schemaVersion: CONFIG.SCHEMA_VERSION,
-      date: ts,
-      entries: [
-        {
-          type: "WORK_START",
-          time: "08:03",
-          source: "DOM",
-          createdAt: new Date().toISOString(),
-        },
-        {
-          type: "BREAK_START",
-          time: "12:01",
-          source: "DOM",
-          createdAt: new Date().toISOString(),
-        },
-        {
-          type: "BREAK_END",
-          time: "13:02",
-          source: "DOM",
-          createdAt: new Date().toISOString(),
-        },
-      ],
-      status: "OPEN",
-    };
-    WorkdayStore.save(fakeWd);
-    const loaded = WorkdayStore.load(ts);
-    console.assert(loaded !== null, "T1: load after save");
-    console.assert(loaded.entries.length === 3, "T1: entry count preserved");
-
-    // ── Test 2: MANUAL entry not overwritten by DOM ──
-    WorkdayStore.registerManual("WORK_END", "17:56");
-    // Simulate DOM sync with a different exit time
-    const wdAfterSync =
-      WorkdayStore.load(WorkdayStore._todayStr()) || WorkdayStore.loadToday();
-    // Register on today's store
-    WorkdayStore.registerManual("WORK_END", "17:56");
-    const wdToday = WorkdayStore.loadToday();
-    const exitEntry = wdToday.entries.find((e) => e.type === "WORK_END");
-    console.assert(
-      exitEntry && exitEntry.source === "MANUAL",
-      "T2: WORK_END is MANUAL",
-    );
-    console.assert(
-      exitEntry && exitEntry.time === "17:56",
-      "T2: WORK_END time preserved as 17:56",
-    );
-    console.assert(
-      wdToday.status === "COMPLETED",
-      "T2: status is COMPLETED after exit",
-    );
-
-    // ── Test 3: EventEngine frozen flag ──
-    const { frozen } = EventEngine.resolve(wdToday, [
-      "08:03",
-      "12:01",
-      "13:02",
-      "18:00",
-    ]);
-    console.assert(frozen === true, "T3: frozen=true when WORK_END is actual");
-    console.log("T3: frozen =", frozen, "(expect: true)");
-
-    // ── Test 4: EventEngine MANUAL override ──
-    const { effectiveBatidas } = EventEngine.resolve(wdToday, [
-      "08:03",
-      "12:01",
-      "13:02",
-      "18:00",
-    ]);
-    console.assert(
-      effectiveBatidas[3] === "17:56",
-      "T4: effectiveBatidas[3] is MANUAL 17:56, not DOM 18:00",
-    );
-    console.log(
-      "T4: effectiveBatidas[3] =",
-      effectiveBatidas[3],
-      "(expect: 17:56)",
-    );
-
-    // ── Test 5: Tolerance classification ──
-    const testTolerance = (saldo, expected) => {
-      const withinTolerance = Math.abs(saldo) <= CONFIG.TOLERANCIA;
-      const result = withinTolerance ? 0 : saldo;
-      console.assert(
-        result === expected,
-        `T5: saldo ${saldo} → ${result} (expect ${expected})`,
-      );
-    };
-    testTolerance(-11, -11); // outside → kept
-    testTolerance(-10, 0); // boundary → zeroed
-    testTolerance(-9, 0); // inside → zeroed
-    testTolerance(0, 0);
-    testTolerance(9, 0);
-    testTolerance(10, 0); // boundary → zeroed
-    testTolerance(11, 11); // outside → kept
-
-    // ── Test 6: RuleEngine daily limit ──
-    const okResult = RuleEngine.dailyLimitRule(7 * 60);
-    const warnResult = RuleEngine.dailyLimitRule(9 * 60);
-    const errResult = RuleEngine.dailyLimitRule(11 * 60);
-    console.assert(okResult.status === "OK", "T6a: daily limit OK");
-    console.assert(warnResult.status === "WARNING", "T6b: daily limit WARNING");
-    console.assert(
-      errResult.status === "VIOLATION",
-      "T6c: daily limit VIOLATION",
-    );
-
-    // ── Test 7: RuleEngine shift limit ──
-    const shiftOk = RuleEngine.shiftLimitRule(["08:00", "13:59"]); // 5h59m
-    const shiftFail = RuleEngine.shiftLimitRule(["08:00", "14:01"]); // 6h01m
-    console.assert(shiftOk.status === "OK", "T7a: shift OK");
-    console.assert(shiftFail.status === "VIOLATION", "T7b: shift VIOLATION");
-
-    // ── Test 8: RuleEngine break ──
-    const breakOk = RuleEngine.breakRule(["08:00", "12:00", "13:00", "17:00"]); // 60m
-    const breakFail = RuleEngine.breakRule([
-      "08:00",
-      "12:00",
-      "12:20",
-      "17:00",
-    ]); // 20m
-    console.assert(breakOk.status === "OK", "T8a: break OK");
-    console.assert(breakFail.status === "VIOLATION", "T8b: break VIOLATION");
-
-    // ── Cleanup test key ──
-    localStorage.removeItem(WorkdayStore._keyFor(ts));
-
-    console.log(
-      "[ahgScenarioTest] All assertions logged above. Check for any failed ones.",
-    );
-    console.groupEnd();
-  };
 })();
