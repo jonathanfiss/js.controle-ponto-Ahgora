@@ -11,6 +11,9 @@
 // @grant        GM_notification
 // @grant        GM_getValue
 // @grant        GM_setValue
+// @grant        GM_addValueChangeListener
+// @grant        GM_addValueChangeListener
+// @grant        GM_openInTab
 // @run-at       document-idle
 
 // @downloadURL  https://github.com/jonathanfiss/js.controle-ponto-Ahgora/raw/refs/heads/master/ahgora-panel.user.js
@@ -51,12 +54,44 @@
       ideal: [5, 1],
       // Lembretes de entrada: dispara N minutos antes do horário padrão de entrada
       // Ajuste HORARIO_ENTRADA_PADRAO para o seu horário de trabalho
-      HORARIO_ENTRADA_PADRAO: "08:00", // "HH:MM" — usado como ancoragem do lembrete de entrada
-      entrada: [15, 5], // avisar 15 e 5 minutos antes da entrada
+      HORARIO_ENTRADA_PADRAO: "09:00", // "HH:MM" — usado como ancoragem do lembrete de entrada
+      entrada: [15, 10, 5, 0], // avisar 15 e 5 minutos antes da entrada
+      // Lembrete de almoço — OPCIONAL
+      // Preencha "HH:MM" para ativar; deixe '' (vazio) para desativar
+      HORARIO_ALMOCO: "12:00", // ex.: '12:00'
+      almoco: [5, 0], // minutos antes do horário (0 = na hora)
+      // Lembrete de retorno do almoço — OPCIONAL
+      // Minutos após a SAÍDA para o almoço em que avisa para lançar o retorno.
+      // 0 (ou vazio) desativa.
+      RETORNO_ALMOCO_APOS_MIN: 70,
     },
     // Janela de recuperação de notificações perdidas (ms)
     // Aumentada para cobrir casos de "abri o browser agora"
     NOTIF_RECOVERY_WINDOW_MS: 4 * 60 * 60 * 1000, // 4 horas
+    // Recarga do espelho logo após registrar a batida em /novabatidaonline/
+    RECARGA_POS_BATIDA: {
+      ATIVO: true,
+      ATRASO_INICIAL_S: 3, // espera após o clique antes de recarregar
+      ESPERA_APOS_CARGA_S: 6, // tempo para o espelho renderizar antes de conferir
+      RETENTATIVAS_S: [10, 20, 30, 45], // se a batida ainda não apareceu, recarrega de novo
+      TEMPO_MAX_S: 180, // desiste após esse tempo
+      // Pergunta se quer abrir o espelho quando ele está fechado
+      PERGUNTAR_ABRIR_ESPELHO: true,
+      ESPELHO_TOLERANCIA_S: 25, // sem sinal de vida por mais que isso = espelho fechado
+      ATRASO_AVISO_S: 2, // espera antes de mostrar a pergunta
+      AVISO_TIMEOUT_S: 20, // some sozinha após esse tempo (0 = fica até fechar)
+    },
+    // Sessão expirada / motor reserva
+    SESSAO: {
+      ATIVO: true,
+      ESPERA_S: 60, // espelho sem sinal de vida por esse tempo = alerta
+      REPETIR_MIN: 30, // repete o alerta a cada N min enquanto continuar deslogado
+    },
+    // Resumo do dia na página de registro de ponto
+    RESUMO_BATIDA: {
+      ATIVO: true,
+      DADOS_ANTIGOS_MIN: 20, // sem atualização do espelho há mais que isso = avisa
+    },
   };
 
   // REGRAS aponta para as mesmas constantes de CONFIG — fonte única de verdade
@@ -70,6 +105,612 @@
     MAX_DIAS_CONSECUTIVOS: 6,
     ON_CALL_MAX: 24 * 60,
     ON_CALL_DESCANSO: CONFIG.DESCANSO_MINIMO,
+  };
+
+  /* =========================================================
+   MirrorBeat — sinal de vida do espelho. O iframe do espelho
+   grava o horário a cada 5s; a página de batida lê para saber
+   se o espelho está aberto.
+========================================================= */
+
+  const MirrorBeat = {
+    KEY: "ahg_mirror_alive",
+
+    beat() {
+      try {
+        GM_setValue(this.KEY, Date.now());
+      } catch {
+        /* silent */
+      }
+    },
+
+    isOpen() {
+      try {
+        const ts = Number(GM_getValue(this.KEY, 0)) || 0;
+        const tolMs =
+          (CONFIG.RECARGA_POS_BATIDA?.ESPELHO_TOLERANCIA_S || 25) * 1000;
+        return Date.now() - ts < tolMs;
+      } catch {
+        return true; // na dúvida, não incomoda
+      }
+    },
+  };
+
+  /* =========================================================
+   PunchSignal — roda na página de batida (/novabatidaonline/).
+   Detecta a confirmação do ponto e avisa o espelho (outra aba).
+  ========================================================= */
+
+  const PunchSignal = {
+    KEY: "ahg_punch_signal",
+
+    attach() {
+      // Captura (3º argumento true) para não depender de stopPropagation do React
+      document.addEventListener(
+        "click",
+        (e) => {
+          const btn = e.target.closest?.("button");
+          if (!btn) return;
+          if (btn.textContent.trim().toLowerCase() !== "registrar ponto")
+            return;
+
+          // Só o botão do modal de confirmação
+          const modal = btn.closest('[role="presentation"]');
+          if (
+            !modal ||
+            !/confirme seu registro de ponto/i.test(modal.textContent)
+          )
+            return;
+
+          this.send();
+        },
+        true,
+      );
+      console.log("[AHGORA PANEL] monitorando registro de ponto nesta página");
+    },
+
+    send() {
+      try {
+        GM_setValue(this.KEY, {
+          ts: Date.now(),
+          nonce: Math.random().toString(36).slice(2),
+        });
+        console.log(
+          "[AHGORA PANEL] ponto registrado → sinal enviado ao espelho",
+        );
+      } catch (e) {
+        console.warn("[AHGORA PANEL] falha ao enviar sinal:", e);
+      }
+      this.verificarEspelho();
+    },
+
+    // Se o espelho não está aberto, pergunta se quer abri-lo
+    verificarEspelho() {
+      const cfg = CONFIG.RECARGA_POS_BATIDA;
+      if (!cfg?.PERGUNTAR_ABRIR_ESPELHO) return;
+      if (MirrorBeat.isOpen()) return;
+      setTimeout(() => this.perguntarAbrir(), (cfg.ATRASO_AVISO_S ?? 2) * 1000);
+    },
+
+    abrirEspelho() {
+      try {
+        if (typeof GM_openInTab === "function") {
+          GM_openInTab(CONFIG.URL_REFRESH, { active: true, insert: true });
+          return;
+        }
+      } catch {
+        /* cai no window.open */
+      }
+      window.open(CONFIG.URL_REFRESH, "_blank");
+    },
+
+    perguntarAbrir() {
+      if (typeof GM_notification !== "function") return;
+      const cfg = CONFIG.RECARGA_POS_BATIDA;
+      GM_notification({
+        title: "✅ Ponto enviado — abrir o espelho?",
+        text: "O espelho não está aberto. Clique aqui para abri-lo e conferir sua batida.",
+        timeout: (cfg.AVISO_TIMEOUT_S ?? 20) * 1000,
+        onclick: () => this.abrirEspelho(),
+      });
+    },
+  };
+
+  /* =========================================================
+   PunchSummary — cartão "Resumo do dia" na página de registro
+   de ponto. Lê o estado publicado pelo espelho (SharedStore).
+========================================================= */
+
+  const PunchSummary = {
+    STATE_KEY: "ahg_shared_state",
+    LS_COLLAPSED: "ahg_summary_collapsed",
+    _el: null,
+
+    init() {
+      if (!CONFIG.RESUMO_BATIDA?.ATIVO) return;
+      if (document.getElementById("ahg-summary")) return;
+
+      this.injectCSS();
+      const el = document.createElement("div");
+      el.id = "ahg-summary";
+      document.body.appendChild(el);
+      this._el = el;
+      this.render();
+
+      Ticker.on(30000, () => this.render()); // atualiza o tempo trabalhado ao vivo
+      try {
+        // atualiza assim que o espelho publicar dados novos
+        GM_addValueChangeListener(this.STATE_KEY, () => this.render());
+        // e logo após você confirmar a batida (mostra "aguardando o espelho")
+        GM_addValueChangeListener(PunchSignal.KEY, () =>
+          setTimeout(() => this.render(), 300),
+        );
+      } catch {
+        /* sem listener: o Ticker cobre */
+      }
+    },
+
+    _esc(s) {
+      return String(s).replace(
+        /[&<>"]/g,
+        (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c],
+      );
+    },
+
+    _isCollapsed() {
+      try {
+        const v = localStorage.getItem(this.LS_COLLAPSED);
+        if (v === null) return window.innerWidth < 600;
+        return v === "1";
+      } catch {
+        return false;
+      }
+    },
+
+    _abrirEspelho() {
+      try {
+        PunchSignal.abrirEspelho();
+      } catch {
+        window.open(CONFIG.URL_REFRESH, "_blank");
+      }
+    },
+
+    render() {
+      const el = this._el;
+      if (!el) return;
+
+      const collapsed = this._isCollapsed();
+      const hoje = new Date();
+      const dataTxt = `${DataHelper.DIAS_SEMANA_CURTO[hoje.getDay()]} ${String(hoje.getDate()).padStart(2, "0")}/${String(hoje.getMonth() + 1).padStart(2, "0")}`;
+
+      el.innerHTML = `
+        <div class="ahg-sum-tit" id="ahg-sum-toggle">📋 Resumo do dia<small>${dataTxt} ${collapsed ? "▸" : "▾"}</small></div>
+        ${collapsed ? "" : `<div class="ahg-sum-body">${this._corpo()}</div>`}
+      `;
+
+      el.querySelector("#ahg-sum-toggle").onclick = () => {
+        try {
+          localStorage.setItem(this.LS_COLLAPSED, collapsed ? "0" : "1");
+        } catch {
+          /* silent */
+        }
+        this.render();
+      };
+      el.querySelector("#ahg-sum-open")?.addEventListener("click", () =>
+        this._abrirEspelho(),
+      );
+    },
+
+    _corpo() {
+      const cfg = CONFIG.RESUMO_BATIDA;
+      const st = SharedStore.get(this.STATE_KEY, null);
+      const espelhoAberto = MirrorBeat.isOpen();
+      const btnEspelho = `<button class="ahg-sum-btn" id="ahg-sum-open">Abrir espelho</button>`;
+
+      // Sem dados de hoje
+      if (!st || st.date !== todayDateStr() || !Array.isArray(st.batidas)) {
+        return espelhoAberto
+          ? `<div class="ahg-sum-aviso">Aguardando o espelho carregar os dados de hoje…</div>`
+          : `<div class="ahg-sum-aviso">Ainda sem dados de hoje.<br>Abra o espelho para sincronizar.</div>${btnEspelho}`;
+      }
+
+      const batidas = st.batidas;
+      const frozen = !!st.frozen;
+      const manMin = (st.manuais || []).map((t) => Hora.toMin(t));
+      const NOMES = ["Entrada", "Saída almoço", "Retorno almoço", "Saída"];
+      const R = (l, v, c = "", vc = "") =>
+        `<div class="ahg-sum-row ${c}"><span class="ahg-sum-lbl">${l}</span><span class="ahg-sum-val ${vc}">${v}</span></div>`;
+
+      let html = "";
+
+      // ── Status de sincronização ─────────────────────────────────────
+      const upd = st.updatedAt || 0;
+      const hhmm = new Date(upd).toTimeString().slice(0, 5);
+      let sig = null;
+      try {
+        sig = GM_getValue(PunchSignal.KEY, null);
+      } catch {
+        /* silent */
+      }
+      const pendente = sig && sig.ts > upd && Date.now() - sig.ts < 180000;
+      const idadeMin = (Date.now() - upd) / 60000;
+
+      let aviso = "";
+      if (pendente) {
+        aviso = espelhoAberto
+          ? "⏳ Aguardando o espelho registrar a batida…"
+          : "⏳ Batida enviada — abra o espelho para atualizar o resumo.";
+      } else if (!espelhoAberto && idadeMin > cfg.DADOS_ANTIGOS_MIN) {
+        aviso = `Dados das ${hhmm} — abra o espelho para atualizar.`;
+      }
+      if (aviso) {
+        html += `<div class="ahg-sum-aviso">${aviso}</div>`;
+        if (!espelhoAberto) html += btnEspelho;
+      }
+
+      // ── Situação e batidas ──────────────────────────────────────────
+      const estado = frozen
+        ? "🛫 Encerrado"
+        : Jornada.resolverEstado(batidas).label;
+      html += R("Situação", estado);
+
+      html += `<div class="ahg-sum-sec">Batidas</div>`;
+      if (!batidas.length) {
+        html += `<div class="ahg-sum-aviso">Nenhuma batida registrada hoje.</div>`;
+      }
+      batidas.forEach((t, i) => {
+        const man = manMin.includes(Hora.toMin(t))
+          ? '<span class="ahg-sum-man" title="Batida manual (local)">✎</span>'
+          : "";
+        html += R(NOMES[i] || `Batida ${i + 1}`, `${this._esc(t)}${man}`);
+      });
+      if (!frozen && batidas.length < NOMES.length) {
+        html += `<div class="ahg-sum-prox">Próxima: ${NOMES[batidas.length]}</div>`;
+      }
+
+      // ── Totais do dia ───────────────────────────────────────────────
+      if (batidas.length) {
+        const trabalhado = Jornada.calcularTrabalhado(batidas);
+        const saldoDia = trabalhado - CONFIG.CARGA_DIARIA;
+        html += `<div class="ahg-sum-sec">Hoje</div>`;
+        html += R(
+          "Trabalhado",
+          Hora.fmtMin(trabalhado),
+          "",
+          trabalhado >= CONFIG.CARGA_DIARIA ? "pos" : "warn",
+        );
+        html += R(
+          "Saldo do dia",
+          Hora.fmtMin(saldoDia),
+          "",
+          saldoDia >= 0 ? "pos" : "neg",
+        );
+      }
+
+      // ── Saídas previstas (dia em andamento) ─────────────────────────
+      if (!frozen && batidas.length) {
+        const s = Jornada.calcularSaidas(batidas, Number(st.saldoSemana) || 0);
+        const linhas = [
+          s.h6 !== null &&
+            R("⚠️ 6h (limite turno)", Hora.fmtHour(s.h6), "warn", "warn"),
+          s.h8 !== null && R("✅ 8h (meta)", Hora.fmtHour(s.h8), "ok", "pos"),
+          s.saidaIdeal !== null &&
+            R("🏆 Saída ideal", Hora.fmtHour(s.saidaIdeal)),
+          s.h10 !== null &&
+            R("⛔ 10h (limite dia)", Hora.fmtHour(s.h10), "danger", "neg"),
+        ]
+          .filter(Boolean)
+          .join("");
+        if (linhas)
+          html += `<div class="ahg-sum-sec">Saídas previstas</div>${linhas}`;
+      }
+
+      // ── Intervalo e descanso ────────────────────────────────────────
+      const iv = Jornada.calcularIntervalo(batidas);
+      if (iv.retornoMinimo) {
+        html += `<div class="ahg-sum-sec">Intervalo</div>`;
+        html += R("⏳ Retorno mínimo", Hora.fmtHour(iv.retornoMinimo));
+        html += R(
+          "⚠️ Retorno máximo",
+          Hora.fmtHour(iv.retornoMaximo),
+          "warn",
+          "warn",
+        );
+      }
+      const d11 = Jornada.calcularDescanso(batidas);
+      if (d11) html += R("🛌 Retorne após (11h)", Hora.fmtHour(d11));
+
+      // ── Saldos ──────────────────────────────────────────────────────
+      if (typeof st.saldoSemanaComHoje === "number") {
+        html += `<div class="ahg-sum-sec">Saldos</div>`;
+        html += R(
+          "Semanal",
+          Hora.fmtMin(st.saldoSemanaComHoje),
+          "",
+          st.saldoSemanaComHoje >= 0 ? "pos" : "neg",
+        );
+        if (typeof st.saldoMes === "number") {
+          html += R(
+            "Mensal",
+            Hora.fmtMin(st.saldoMes),
+            "",
+            st.saldoMes >= 0 ? "pos" : "neg",
+          );
+        }
+      }
+
+      html += `<div class="ahg-sum-foot">Atualizado ${hhmm}</div>`;
+      return html;
+    },
+
+    injectCSS() {
+      if (document.getElementById("ahg-summary-css")) return;
+      const style = document.createElement("style");
+      style.id = "ahg-summary-css";
+      style.textContent = `
+        #ahg-summary{
+            position:fixed;bottom:16px;right:16px;z-index:1000;width:270px;
+            background:#0f0f1e;border:1px solid #252545;border-radius:14px;
+            color:#dde;font-family:'Segoe UI',sans-serif;font-size:12px;
+            box-shadow:0 8px 40px rgba(0,0,0,.45);overflow:hidden;
+        }
+        .ahg-sum-tit{
+            display:flex;align-items:center;gap:6px;cursor:pointer;user-select:none;
+            background:linear-gradient(135deg,#3b2d82,#1e1b4b);color:#b9a9ff;
+            font-weight:700;font-size:11px;letter-spacing:1.2px;text-transform:uppercase;
+            padding:9px 12px;
+        }
+        .ahg-sum-tit small{margin-left:auto;opacity:.75;font-weight:600;letter-spacing:0;text-transform:none;}
+        .ahg-sum-body{
+            padding:8px 10px 10px;display:flex;flex-direction:column;gap:4px;
+            max-height:60vh;overflow-y:auto;
+        }
+        .ahg-sum-row{
+            display:flex;justify-content:space-between;align-items:center;
+            padding:4px 8px;border-radius:7px;
+            background:rgba(100,100,255,.1);border-left:3px solid #7878ff;
+        }
+        .ahg-sum-row.ok{background:rgba(61,220,132,.1);border-color:#3ddc84;}
+        .ahg-sum-row.warn{background:rgba(255,165,0,.12);border-color:orange;}
+        .ahg-sum-row.danger{background:rgba(255,60,60,.14);border-color:#ff4444;}
+        .ahg-sum-lbl{color:#9a9ac0;font-size:11.5px;}
+        .ahg-sum-val{font-weight:700;font-size:13px;color:#b9a9ff;text-align:right;}
+        .ahg-sum-val.pos{color:#3ddc84;}
+        .ahg-sum-val.neg{color:#ff6b6b;}
+        .ahg-sum-val.warn{color:orange;}
+        .ahg-sum-sec{
+            font-size:10px;letter-spacing:1px;text-transform:uppercase;
+            color:#6a6a90;padding:5px 0 1px;font-weight:700;
+        }
+        .ahg-sum-aviso{
+            font-size:11.5px;color:#ffb347;padding:5px 8px;border-radius:7px;
+            background:rgba(255,165,0,.1);
+        }
+        .ahg-sum-prox{font-size:11px;color:#7880aa;padding:0 8px;font-style:italic;}
+        .ahg-sum-man{color:#ffb347;margin-left:4px;}
+        .ahg-sum-foot{font-size:10px;font-weight:700;color:#555880;text-align:right;padding-top:4px;}
+        .ahg-sum-btn{
+            background:#3b2d82;color:#fff;border:none;border-radius:6px;
+            padding:6px 10px;cursor:pointer;font-size:12px;
+        }
+        .ahg-sum-btn:hover{background:#4a3faf;}
+        .ahg-sum-body::-webkit-scrollbar{width:8px;}
+        .ahg-sum-body::-webkit-scrollbar-thumb{background:#444466;border-radius:10px;}
+        @media (max-width:600px){
+            #ahg-summary{width:calc(100% - 24px);right:12px;bottom:12px;}
+        }
+      `;
+      document.head.appendChild(style);
+    },
+  };
+
+  /* =========================================================
+   SessionGuard — avisa quando a sessão do Ahgora expirou
+   (página de login ou espelho que não está carregando).
+========================================================= */
+
+  const SessionGuard = {
+    KEY: "ahg_session_alert_ts",
+    _loadedAt: Date.now(),
+
+    isLoginPage() {
+      return !!document.querySelector('input[type="password"]');
+    },
+
+    naPaginaEspelho() {
+      return location.pathname.includes("/externo/mirror");
+    },
+
+    check() {
+      const cfg = CONFIG.SESSAO;
+      if (!cfg?.ATIVO) return;
+      if (location.pathname.includes("/novabatidaonline")) return; // espelho fechado ali é normal
+      if (MirrorBeat.isOpen()) return; // espelho ativo = sessão ok
+
+      const login = this.isLoginPage();
+      if (!login && !this.naPaginaEspelho()) return; // outras páginas: não alerta
+
+      const upS = (Date.now() - this._loadedAt) / 1000;
+      if (upS < (login ? 8 : cfg.ESPERA_S)) return; // dá tempo da página carregar
+
+      const last = Number(GM_getValue(this.KEY, 0)) || 0;
+      if (Date.now() - last < cfg.REPETIR_MIN * 60000) return;
+      try {
+        GM_setValue(this.KEY, Date.now());
+      } catch {
+        /* silent */
+      }
+
+      this.alertar();
+    },
+
+    alertar() {
+      if (!document.title.startsWith("🔒"))
+        document.title = `🔒 ${document.title}`;
+      if (typeof GM_notification !== "function") return;
+      GM_notification({
+        title: "🔒 Ahgora: sessão expirada",
+        text: "O painel parou de monitorar seu ponto. Faça login novamente para voltar a receber as notificações.",
+        timeout: 0, // fica na tela até você fechar
+        onclick: () => {
+          try {
+            window.focus();
+          } catch {
+            /* silent */
+          }
+        },
+      });
+    },
+  };
+
+  /* =========================================================
+   PunchSync — roda no iframe do espelho. Recebe o sinal,
+   recarrega e confere se a batida apareceu (com retentativas).
+   Key: "ahg_punch_watch" { date, baseCount, startedAt, attempts, phase, nextAt }
+========================================================= */
+
+  const PunchSync = {
+    SIGNAL_KEY: "ahg_punch_signal",
+    WATCH_KEY: "ahg_punch_watch",
+    _since: Date.now(),
+    _seen: null,
+
+    // Batidas reais de hoje no espelho (sem as manuais locais)
+    contarHoje() {
+      const el = document.querySelector(".v-calendar-weekly__day.v-present");
+      if (!el) return null;
+      return [...el.querySelectorAll(".batida")].filter(
+        (x) => !x.classList.contains("prevista"),
+      ).length;
+    },
+
+    _readSignal() {
+      try {
+        return GM_getValue(this.SIGNAL_KEY, null);
+      } catch {
+        return null;
+      }
+    },
+
+    _loadWatch() {
+      try {
+        const o = JSON.parse(localStorage.getItem(this.WATCH_KEY) || "null");
+        return o && o.date === todayDateStr() ? o : null;
+      } catch {
+        return null;
+      }
+    },
+
+    _saveWatch(o) {
+      try {
+        if (o) localStorage.setItem(this.WATCH_KEY, JSON.stringify(o));
+        else localStorage.removeItem(this.WATCH_KEY);
+      } catch {
+        /* silent */
+      }
+    },
+
+    init() {
+      this._since = Date.now();
+      this._seen = this._readSignal()?.nonce ?? null; // ignora sinais antigos
+
+      const handle = (v) => {
+        if (!v || v.nonce === this._seen) return;
+        if (Date.now() - (v.ts || 0) > 60000) return; // sinal velho demais
+        this._seen = v.nonce;
+        this.onSignal();
+      };
+
+      if (typeof GM_addValueChangeListener === "function") {
+        try {
+          GM_addValueChangeListener(
+            this.SIGNAL_KEY,
+            (name, oldV, newV, remote) => {
+              if (remote === false) return;
+              handle(newV);
+            },
+          );
+          return;
+        } catch {
+          /* cai no polling */
+        }
+      }
+      Ticker.on(1000, () => handle(this._readSignal())); // fallback por polling
+    },
+
+    onSignal() {
+      const cfg = CONFIG.RECARGA_POS_BATIDA;
+      if (!cfg?.ATIVO) return;
+      const now = Date.now();
+      console.log("[AHGORA PANEL] sinal de ponto recebido — recarga agendada");
+      this._saveWatch({
+        date: todayDateStr(),
+        baseCount: this.contarHoje(), // null se o mês de hoje não está visível
+        startedAt: now,
+        attempts: 0,
+        phase: "reload",
+        nextAt: now + cfg.ATRASO_INICIAL_S * 1000,
+      });
+    },
+
+    _reload() {
+      STATE.nextRefresh = Date.now() + CONFIG.AUTO_REFRESH_MIN * 60 * 1000;
+      window.top.location = CONFIG.URL_REFRESH;
+    },
+
+    // Chamado a cada 2s pelo Ticker (roda também em aba oculta)
+    tick() {
+      const cfg = CONFIG.RECARGA_POS_BATIDA;
+      if (!cfg?.ATIVO) return;
+
+      const w = this._loadWatch();
+      if (!w) return;
+
+      const now = Date.now();
+      if (now - w.startedAt > cfg.TEMPO_MAX_S * 1000) {
+        this._saveWatch(null);
+        return;
+      }
+      if (now < w.nextAt) return;
+
+      // Fase 1: recarrega o espelho
+      if (w.phase === "reload") {
+        w.phase = "verify";
+        w.nextAt = 0;
+        this._saveWatch(w);
+        this._reload();
+        return;
+      }
+
+      // Fase 2 (após a recarga): confere se a batida apareceu
+      if (now - this._since < cfg.ESPERA_APOS_CARGA_S * 1000) return; // deixa renderizar
+
+      const atual = this.contarHoje();
+      const apareceu =
+        w.baseCount === null || (atual !== null && atual > w.baseCount);
+
+      if (apareceu) {
+        console.log("[AHGORA PANEL] batida apareceu no espelho");
+        this._saveWatch(null);
+        render();
+        return;
+      }
+
+      w.attempts++;
+      const delays = cfg.RETENTATIVAS_S || [];
+      if (w.attempts > delays.length) {
+        console.log("[AHGORA PANEL] batida não apareceu — desistindo");
+        this._saveWatch(null);
+        return;
+      }
+
+      console.log(
+        `[AHGORA PANEL] batida ainda não apareceu — nova tentativa em ${delays[w.attempts - 1]}s`,
+      );
+      w.phase = "reload";
+      w.nextAt = now + delays[w.attempts - 1] * 1000;
+      this._saveWatch(w);
+    },
   };
 
   /* =========================================================
@@ -105,6 +746,51 @@
     const [h, m] = s.split(":").map(Number);
     return h * 60 + m;
   }
+
+  /* =========================================================
+   SharedStore — armazenamento do Tampermonkey, compartilhado
+   entre todas as páginas/origens do script (JSON).
+========================================================= */
+
+  const SharedStore = {
+    get(key, fallback = null) {
+      try {
+        const raw = GM_getValue(key, null);
+        if (raw === null || raw === undefined) return fallback;
+        return typeof raw === "string" ? JSON.parse(raw) : raw;
+      } catch {
+        return fallback;
+      }
+    },
+    set(key, value) {
+      try {
+        GM_setValue(key, JSON.stringify(value));
+        return true;
+      } catch {
+        return false;
+      }
+    },
+  };
+
+  /* =========================================================
+   Leader — evita que duas abas (ex.: login + batida) disparem
+   a mesma notificação no modo reserva.
+========================================================= */
+
+  const Leader = {
+    KEY: "ahg_fallback_leader",
+    _id: Math.random().toString(36).slice(2),
+
+    isLeader() {
+      const cur = SharedStore.get(this.KEY, null);
+      const now = Date.now();
+      if (!cur || cur.id === this._id || now - cur.ts > 5000) {
+        SharedStore.set(this.KEY, { id: this._id, ts: now });
+        return true;
+      }
+      return false;
+    },
+  };
 
   /* =========================================================
    ManualPunches — batidas manuais locais (solicitações que
@@ -661,19 +1347,28 @@
     _timers: new Map(),
 
     load() {
+      const shared = SharedStore.get(this._KEY, null);
+      if (shared && Array.isArray(shared.schedules)) return shared;
+      // migração: lê do localStorage legado (origem do espelho)
       try {
         const raw = localStorage.getItem(this._KEY);
-        return raw ? JSON.parse(raw) : { schedules: [] };
+        if (raw) {
+          const o = JSON.parse(raw);
+          if (o && Array.isArray(o.schedules)) return o;
+        }
       } catch {
-        return { schedules: [] };
+        /* silent */
       }
+      return { schedules: [] };
     },
 
     save(data) {
-      try {
-        localStorage.setItem(this._KEY, JSON.stringify(data));
-      } catch {
-        /* silent */
+      if (!SharedStore.set(this._KEY, data)) {
+        try {
+          localStorage.setItem(this._KEY, JSON.stringify(data));
+        } catch {
+          /* silent */
+        }
       }
     },
 
@@ -742,6 +1437,52 @@
         });
     },
 
+    // Chamado a cada 1s pelo Ticker: dispara o que venceu, sem depender de setTimeout
+    tick() {
+      const data = this.load();
+      const now = Date.now();
+      const today = todayDateStr();
+
+      data.schedules
+        .filter((s) => !s.fired && s.workdayDate === today)
+        .forEach((s) => {
+          const diff = new Date(s.scheduledFor).getTime() - now;
+          if (diff > 0) return; // ainda no futuro
+          if (diff > -2 * 60 * 1000)
+            this._fire(s.id, s.type); // no horário (até 2 min de atraso)
+          else if (diff > -CONFIG.NOTIF_RECOVERY_WINDOW_MS)
+            this._fireMissed(s.id, s.type, new Date(s.scheduledFor)); // perdida recente
+          else this._expire(s.id); // velha demais
+        });
+    },
+
+    _expire(id) {
+      const data = this.load();
+      const s = data.schedules.find((x) => x.id === id);
+      if (s && !s.fired) {
+        s.fired = true;
+        this.save(data);
+      }
+    },
+
+    // Agenda lembretes por horário SEM contexto de calendário (sessão expirada)
+    ensureStatic() {
+      const today = todayDateStr();
+      const st = SharedStore.get("ahg_shared_state", null);
+      const known =
+        st && st.date === today ? st : { entries: [], frozen: false };
+      this.updateFromContext(
+        {
+          jornadaHoje: {
+            saidas: { h6: null, h8: null, h10: null, saidaIdeal: null },
+          },
+          frozen: !!known.frozen,
+          workday: { entries: known.entries || [] },
+        },
+        today,
+      );
+    },
+
     _arm(id, type, scheduledFor, workdayDate) {
       const ms = new Date(scheduledFor).getTime() - Date.now();
       if (ms <= 0) return;
@@ -786,14 +1527,41 @@
           body: "Lembre de registrar sua entrada.",
         },
       };
-      const lbl = LABELS[type] || { title: `⏰ ${type}`, body: "" };
-      notif(
-        `sched-${id}`,
-        lbl.title,
-        lbl.body,
-        type.includes("H10") || type === "ENTRY_REMINDER",
-        0,
-      );
+      let lbl = LABELS[type] || { title: `⏰ ${type}`, body: "" };
+      let urgente = type.includes("H10") || type === "ENTRY_REMINDER";
+      let opts = {};
+
+      if (type === "LUNCH_REMINDER") {
+        const antecip = Number(
+          (/^LUNCH_REMINDER-(\d+)-/.exec(id) || [])[1] || 0,
+        );
+        const janela = LunchLive.corpo();
+        lbl =
+          antecip > 0
+            ? {
+                title: "🍽️ Almoço chegando",
+                body: `Faltam ${antecip} minuto${antecip > 1 ? "s" : ""} para o horário de almoço (${CONFIG.NOTIFICACOES.HORARIO_ALMOCO}).\n${janela}`,
+              }
+            : {
+                title: "🍽️ Hora do almoço!",
+                body: `Não esqueça de bater o ponto de saída para o almoço.\n${janela}`,
+              };
+        urgente = antecip === 0; // só o aviso na hora exige confirmação
+        opts = { tag: LunchLive.TAG }; // as atualizações vão substituir esta notificação
+        LunchLive.start(); // começa a atualizar a janela de retorno
+      }
+
+      if (type === "LUNCH_RETURN_REMINDER") {
+        const m = Number(CONFIG.NOTIFICACOES.RETORNO_ALMOCO_APOS_MIN) || 60;
+        const txt = m % 60 === 0 ? `${m / 60}h` : `${m} min`;
+        lbl = {
+          title: "🍽️ Volta do almoço",
+          body: `Já se passaram ${txt} da saída para o almoço. Registre o retorno.`,
+        };
+        urgente = true; // fica na tela até você fechar
+      }
+
+      notif(`sched-${id}`, lbl.title, lbl.body, urgente, 0, opts);
       this._timers.delete(id);
     },
 
@@ -805,6 +1573,18 @@
       if (!sched || sched.fired) return;
 
       sched.fired = true;
+      if (type === "LUNCH_REMINDER") {
+        const agora = Date.now();
+        data.schedules.forEach((s) => {
+          if (
+            s.type === type &&
+            s.workdayDate === sched.workdayDate &&
+            !s.fired &&
+            new Date(s.scheduledFor).getTime() <= agora
+          )
+            s.fired = true;
+        });
+      }
       this.save(data);
 
       const hora = scheduledDate
@@ -832,6 +1612,14 @@
           title: "⏰ Não esqueça de bater o ponto",
           body: `Seu horário de entrada era às ${hora}.`,
         },
+        LUNCH_REMINDER: {
+          title: "🍽️ Lembrete de almoço",
+          body: `Horário de almoço: ${CONFIG.NOTIFICACOES.HORARIO_ALMOCO}. Registre a saída se ainda não bateu.\n${LunchLive.corpo()}`,
+        },
+        LUNCH_RETURN_REMINDER: {
+          title: "🍽️ Retorno do almoço",
+          body: `O retorno estava previsto para ${hora}. Registre o ponto de volta se já voltou.`,
+        },
       };
       const lbl = LABELS_MISSED[type] || {
         title: `⏰ Perdida: ${type}`,
@@ -847,11 +1635,20 @@
       const { jornadaHoje } = ctx;
       const frozen = ctx.frozen || false;
 
-      // ── Helper interno: upsert uma entrada no batch ──────────────────
+      // ── Helpers ──────────────────────────────────────────────────────
+      const now = new Date();
+      const datePfx = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
+      const minToIso = (min) => {
+        const n = ((Math.round(min) % 1440) + 1440) % 1440;
+        return `${datePfx}T${String(Math.floor(n / 60)).padStart(2, "0")}:${String(n % 60).padStart(2, "0")}:00`;
+      };
+      const isFuture = (iso) => new Date(iso).getTime() > Date.now();
+      const horarioValido = (h) =>
+        typeof h === "string" && /^([01]?\d|2[0-3]):[0-5]\d$/.test(h.trim());
+
+      // upsert por ID: permite vários lembretes do mesmo tipo (ex.: 15 e 5 min antes)
       const upsert = (data, id, type, iso) => {
-        data.schedules = data.schedules.filter(
-          (s) => !(s.type === type && s.workdayDate === todayStr),
-        );
+        data.schedules = data.schedules.filter((s) => s.id !== id);
         data.schedules.push({
           id,
           type,
@@ -863,16 +1660,22 @@
         this._arm(id, type, iso, todayStr);
       };
 
-      // ── Helper: converte minutos-desde-meia-noite em ISO do dia atual ─
-      const now = new Date();
-      const datePfx = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
-      const minToIso = (min) => {
-        const n = ((Math.round(min) % 1440) + 1440) % 1440;
-        return `${datePfx}T${String(Math.floor(n / 60)).padStart(2, "0")}:${String(n % 60).padStart(2, "0")}:00`;
+      // Cancela os pendentes (não disparados) de um tipo no dia
+      const cancelPending = (data, type) => {
+        const antes = data.schedules.length;
+        data.schedules = data.schedules.filter(
+          (s) => !(s.type === type && s.workdayDate === todayStr && !s.fired),
+        );
+        [...this._timers.keys()]
+          .filter((id) => id.startsWith(type) && id.endsWith(todayStr))
+          .forEach((id) => {
+            clearTimeout(this._timers.get(id));
+            this._timers.delete(id);
+          });
+        return data.schedules.length !== antes;
       };
-      const isFuture = (iso) => new Date(iso).getTime() > Date.now();
 
-      // ── Workday frozen: cancelar TODAS as notificações de saída ──────
+      // ── Workday frozen: cancelar TODAS as notificações do dia ────────
       if (frozen) {
         const data = this.load();
         const EXIT_TYPES = [
@@ -881,6 +1684,8 @@
           "EXPECTED_EXIT_H10",
           "EXPECTED_EXIT_IDEAL",
           "ENTRY_REMINDER",
+          "LUNCH_REMINDER",
+          "LUNCH_RETURN_REMINDER",
         ];
         let changed = false;
         EXIT_TYPES.forEach((type) => {
@@ -889,7 +1694,6 @@
             (s) => !(s.type === type && s.workdayDate === todayStr),
           );
           if (data.schedules.length !== before) {
-            // limpar timers em memória
             [...this._timers.keys()]
               .filter((id) => id.startsWith(type))
               .forEach((id) => {
@@ -908,26 +1712,65 @@
       this._calcVersion++;
       let changed = false;
 
-      // 1. Lembretes de entrada (só se entrada ainda não foi batida)
-      const temEntrada = ctx.workday?.entries?.some(
-        (e) => e.type === "WORK_START",
-      );
-      if (!temEntrada) {
-        const entradaMin = hmToMin(CONFIG.NOTIFICACOES.HORARIO_ENTRADA_PADRAO);
-        CONFIG.NOTIFICACOES.entrada.forEach((antecipMin) => {
-          const iso = minToIso(entradaMin - antecipMin);
+      const entries = ctx.workday?.entries || [];
+      const temEntrada = entries.some((e) => e.type === "WORK_START");
+      const temAlmoco = entries.some((e) => e.type === "BREAK_START");
+
+      // Lembrete genérico: agenda `antecips` minutos antes de `horario`.
+      // Se não estiver ativo (ou horário vazio/inválido), cancela os pendentes.
+      const lembrete = (type, horario, antecips, ativo) => {
+        if (!ativo || !horarioValido(horario)) {
+          if (cancelPending(data, type)) changed = true;
+          return;
+        }
+        const baseMin = hmToMin(horario.trim());
+        (Array.isArray(antecips) ? antecips : []).forEach((antecipMin) => {
+          const iso = minToIso(baseMin - antecipMin);
           if (!isFuture(iso)) return;
+          upsert(data, `${type}-${antecipMin}-${todayStr}`, type, iso);
+          changed = true;
+        });
+      };
+
+      // 1. Entrada: só enquanto a entrada não foi batida
+      lembrete(
+        "ENTRY_REMINDER",
+        CONFIG.NOTIFICACOES.HORARIO_ENTRADA_PADRAO,
+        CONFIG.NOTIFICACOES.entrada,
+        !temEntrada,
+      );
+
+      // 2. Almoço (opcional): só se HORARIO_ALMOCO estiver preenchido,
+      //    a entrada já foi batida e a saída para o almoço ainda não
+      lembrete(
+        "LUNCH_REMINDER",
+        CONFIG.NOTIFICACOES.HORARIO_ALMOCO,
+        CONFIG.NOTIFICACOES.almoco,
+        temEntrada && !temAlmoco,
+      );
+
+      // 3. Retorno do almoço (opcional): N min após a saída para o almoço REAL.
+      //    Cancela se o retorno já foi batido ou se o parâmetro estiver desativado.
+      const saidaAlmoco = entries.find((e) => e.type === "BREAK_START");
+      const temRetorno = entries.some((e) => e.type === "BREAK_END");
+      const aposMin = Number(CONFIG.NOTIFICACOES.RETORNO_ALMOCO_APOS_MIN);
+
+      if (saidaAlmoco && !temRetorno && aposMin > 0) {
+        const iso = minToIso(hmToMin(saidaAlmoco.time) + aposMin);
+        if (isFuture(iso)) {
           upsert(
             data,
-            `ENTRY_REMINDER-${antecipMin}-${todayStr}`,
-            "ENTRY_REMINDER",
+            `LUNCH_RETURN_REMINDER-${todayStr}`,
+            "LUNCH_RETURN_REMINDER",
             iso,
           );
           changed = true;
-        });
+        }
+      } else if (cancelPending(data, "LUNCH_RETURN_REMINDER")) {
+        changed = true;
       }
 
-      // 2. Saídas previstas
+      // 4. Saídas previstas
       const saidas = jornadaHoje.saidas;
       [
         { type: "EXPECTED_EXIT_H6", min: saidas.h6 },
@@ -943,6 +1786,112 @@
       });
 
       if (changed) this.save(data);
+    },
+  };
+
+  /* =========================================================
+   LunchLive — atualiza a notificação de almoço com a janela
+   de retorno (mínimo/máximo) até a saída ser registrada.
+   Usa CONFIG.INTERVALO_MINIMO / INTERVALO_MAXIMO.
+   Key: "ahg_lunch_live"  { date, active, startedAt, lastAt }
+========================================================= */
+
+  const LunchLive = {
+    _KEY: "ahg_lunch_live",
+    TAG: "ahg-lunch-live", // mesma tag = a notificação é substituída
+
+    _load() {
+      try {
+        const o = JSON.parse(localStorage.getItem(this._KEY) || "null");
+        return o && o.date === todayDateStr() ? o : null;
+      } catch {
+        return null;
+      }
+    },
+
+    _save(o) {
+      try {
+        if (o) localStorage.setItem(this._KEY, JSON.stringify(o));
+        else localStorage.removeItem(this._KEY);
+      } catch {
+        /* silent */
+      }
+    },
+
+    // Janela de retorno considerando que a saída seria AGORA
+    corpo() {
+      const base = Hora.nowMin();
+      const min = base + CONFIG.INTERVALO_MINIMO;
+      const max = base + CONFIG.INTERVALO_MAXIMO;
+      return `Se sair agora:\n⏳ Retorno mínimo: ${Hora.fmtHour(min)}\n⚠️ Retorno máximo: ${Hora.fmtHour(max)}`;
+    },
+
+    // Chamado quando o lembrete de almoço dispara
+    start() {
+      if (!(Number(CONFIG.NOTIFICACOES.ALMOCO_ATUALIZAR_MIN) > 0)) return;
+      const cur = this._load();
+      if (cur && cur.active) return;
+      this._save({
+        date: todayDateStr(),
+        active: true,
+        startedAt: Date.now(),
+        lastAt: Date.now(),
+      });
+    },
+
+    stop() {
+      this._save(null);
+    },
+
+    // Chamado a cada 1s pelo Ticker (roda também em aba oculta)
+    tick() {
+      const st = this._load();
+      if (!st || !st.active) return;
+
+      const wd = WorkdayStore.loadToday();
+      const jaSaiu = wd.entries.some((e) => e.type === "BREAK_START");
+      const encerrado =
+        wd.status === "COMPLETED" ||
+        wd.entries.some((e) => e.type === "WORK_END");
+      const maxMs =
+        (Number(CONFIG.NOTIFICACOES.ALMOCO_ATUALIZAR_MAX_MIN) || 120) * 60000;
+      const expirou = Date.now() - st.startedAt > maxMs;
+
+      if (jaSaiu || encerrado || expirou) {
+        this.stop();
+        return;
+      }
+
+      // Enquanto ativo, recarrega o espelho com mais frequência para enxergar a batida
+      const refMin = Number(CONFIG.NOTIFICACOES.ALMOCO_REFRESH_MIN);
+      if (refMin > 0) {
+        const alvo = Date.now() + refMin * 60000;
+        if (STATE.nextRefresh > alvo) STATE.nextRefresh = alvo;
+      }
+
+      const everyMs = Number(CONFIG.NOTIFICACOES.ALMOCO_ATUALIZAR_MIN) * 60000;
+      if (Date.now() - st.lastAt < everyMs) return;
+
+      st.lastAt = Date.now();
+      this._save(st);
+
+      notif(
+        `lunchlive-${st.lastAt}`,
+        "🍽️ Saída para o almoço",
+        this.corpo(),
+        true,
+        0,
+        {
+          tag: this.TAG,
+          silent: true, // atualizações sem som
+          timeout: everyMs + 15000, // some sozinha logo após a batida
+          // fechou a notificação → para. O guard de 3s ignora o "fechamento"
+          // da notificação antiga quando ela é substituída pela nova.
+          onDone: (user) => {
+            if (user && Date.now() - st.lastAt > 3000) LunchLive.stop();
+          },
+        },
+      );
     },
   };
 
@@ -1741,8 +2690,9 @@
 
     renderStatus(ctx) {
       const { jornadaHoje } = ctx;
-      const encerrado = jornadaHoje.estado.codigo === "ENCERRADO";
-      const expandido = encerrado && STATE.statusExpandido;
+      const codigo = jornadaHoje.estado.codigo;
+      const temDetalhe = codigo !== "SEM_BATIDA"; // há batidas para detalhar
+      const expandido = temDetalhe && STATE.statusExpandido;
 
       const alertaHtml = jornadaHoje.alerta
         ? Template.linha(
@@ -1752,9 +2702,9 @@
           )
         : "";
 
-      // Linha de situação: quando encerrado, vira clicável e mostra seta
+      // Linha de situação: clicável sempre que houver batidas
       const seta = expandido ? "▾" : "▸";
-      const situacaoHtml = encerrado
+      const situacaoHtml = temDetalhe
         ? `<div class="a-row infos clickable" id="ahg-status-toggle" style="user-select:none;">
                        <span class="a-lbl">Situação</span>
                        <span class="a-val neu" style="display:flex;align-items:center;gap:5px;">
@@ -1768,47 +2718,46 @@
             "infos",
           );
 
-      // Detalhe expandido dos turnos
+      // Detalhe expandido: turnos, intervalo e o que está em andamento
       let detalheHtml = "";
       if (expandido) {
         const { turno1, turno2 } = jornadaHoje;
         const actualExit = jornadaHoje.saidas?.actualExit;
 
-        const linhaT1 = turno1
-          ? `<div class="a-status-detalhe-linha">
-                           <span>1º turno</span>
-                           <span>${turno1.entrada} → ${turno1.saida ?? "--:--"}</span>
-                           <span class="a-val neu" style="font-size:13px;">${Hora.fmtMin(turno1.total)}</span>
-                       </div>`
-          : "";
+        const linhaTurno = (n, t, saidaFinal) => {
+          if (!t) return "";
+          const fim = t.aberto ? "agora" : (saidaFinal ?? t.saida ?? "--:--");
+          return `<div class="a-status-detalhe-linha${t.aberto ? " a-status-detalhe-linha--aberto" : ""}">
+                           <span>${n}º turno${t.aberto ? '<small class="a-status-tag">em andamento</small>' : ""}</span>
+                           <span>${t.entrada} → ${fim}</span>
+                           <span class="a-val neu" style="font-size:13px;">${Hora.fmtMin(t.total)}</span>
+                       </div>`;
+        };
 
-        // Intervalo
-        const linhaIntervalo =
-          turno1?.saida && turno2?.entrada
-            ? (() => {
-                const intervMin =
-                  Hora.toMin(turno2.entrada) - Hora.toMin(turno1.saida);
-                return `<div class="a-status-detalhe-linha a-status-detalhe-linha--intervalo">
+        // Intervalo: concluído (entre os dois turnos) ou em andamento
+        let linhaIntervalo = "";
+        if (turno1?.saida && turno2?.entrada) {
+          const intervMin =
+            Hora.toMin(turno2.entrada) - Hora.toMin(turno1.saida);
+          linhaIntervalo = `<div class="a-status-detalhe-linha a-status-detalhe-linha--intervalo">
                                     <span>Intervalo</span>
                                     <span>${turno1.saida} → ${turno2.entrada}</span>
                                     <span style="font-size:13px;color:#555880;">${Hora.fmtMin(intervMin)}</span>
                                 </div>`;
-              })()
-            : "";
-
-        const linhaT2 = turno2
-          ? `<div class="a-status-detalhe-linha">
-                           <span>2º turno</span>
-                           <span>${turno2.entrada} → ${actualExit ?? turno2.saida ?? "--:--"}</span>
-                           <span class="a-val neu" style="font-size:13px;">${Hora.fmtMin(turno2.total)}</span>
-                       </div>`
-          : "";
+        } else if (codigo === "INTERVALO" && turno1?.saida) {
+          const decorrido = Hora.nowMin() - Hora.toMin(turno1.saida);
+          linhaIntervalo = `<div class="a-status-detalhe-linha a-status-detalhe-linha--intervalo a-status-detalhe-linha--aberto">
+                                    <span>Intervalo<small class="a-status-tag">em andamento</small></span>
+                                    <span>${turno1.saida} → agora</span>
+                                    <span class="a-val neu" style="font-size:13px;">${Hora.fmtMin(decorrido)}</span>
+                                </div>`;
+        }
 
         detalheHtml = `
                     <div class="a-status-detalhe" id="ahg-status-detalhe">
-                        ${linhaT1}
+                        ${linhaTurno(1, turno1)}
                         ${linhaIntervalo}
-                        ${linhaT2}
+                        ${linhaTurno(2, turno2, actualExit)}
                     </div>`;
       }
 
@@ -1984,6 +2933,8 @@
                 </div>
                 <div class="a-menu-body" id="ahg-debug-body" style="display:${STATE.menuDebug ? "flex" : "none"};flex-direction:column;gap:4px;padding-top:4px;">
                     ${Template.botao("ahg-dbg-entrada", "Lembrete entrada", "⏰")}
+                    ${Template.botao("ahg-dbg-almoco", "Lembrete almoço", "🍽️")}
+                    ${Template.botao("ahg-dbg-retorno", "Retorno almoço", "🍽️")}
                     ${Template.botao("ahg-dbg-6h", "Limite turno (6h)", "⚠️")}
                     ${Template.botao("ahg-dbg-8h", "Meta diária (8h)", "✅")}
                     ${Template.botao("ahg-dbg-10h", "Limite dia (10h)", "⛔")}
@@ -2099,6 +3050,28 @@
               "entrada",
               "⏰ Hora de bater ponto!",
               "Lembre de registrar sua entrada.",
+              true,
+            ),
+          );
+
+        document
+          .getElementById("ahg-dbg-almoco")
+          ?.addEventListener("click", () =>
+            dbgNotif(
+              "almoco",
+              "🍽️ Hora do almoço!",
+              "Não esqueça de bater o ponto de saída para o almoço.",
+              true,
+            ),
+          );
+
+        document
+          .getElementById("ahg-dbg-retorno")
+          ?.addEventListener("click", () =>
+            dbgNotif(
+              "retorno",
+              "🍽️ Volta do almoço",
+              "Já se passou 1h da saída para o almoço. Registre o retorno.",
               true,
             ),
           );
@@ -2491,7 +3464,14 @@
     }
   }
 
-  function notif(id, title, body, urgente = false, ttlMs = 60 * 1000) {
+  function notif(
+    id,
+    title,
+    body,
+    urgente = false,
+    ttlMs = 60 * 1000,
+    opts = {},
+  ) {
     const agora = Date.now();
     const ultima = STATE.notificationsFired.get(id);
     if (ultima && agora - ultima < ttlMs) return;
@@ -2502,12 +3482,16 @@
 
     // 1- GM_notification direto (funciona em qualquer frame e com a aba em segundo plano)
     if (typeof GM_notification === "function") {
-      GM_notification({
+      const det = {
         title,
         text: bodyFull,
-        timeout: urgente ? 0 : 8000,
+        timeout: opts.timeout ?? (urgente ? 0 : 8000),
         onclick: url ? () => window.open(url, "_blank", "noopener") : undefined,
-      });
+      };
+      if (opts.tag) det.tag = opts.tag; // mesma tag substitui a anterior
+      if (opts.silent) det.silent = true;
+      if (opts.onDone) det.ondone = opts.onDone;
+      GM_notification(det);
       return;
     }
 
@@ -2531,7 +3515,8 @@
       const n = new Notification(title, {
         body: bodyFull,
         requireInteraction: urgente,
-        tag: `${id}-${agora}`,
+        silent: !!opts.silent,
+        tag: opts.tag || `${id}-${agora}`,
       });
       if (url)
         n.onclick = () => {
@@ -2725,6 +3710,13 @@
         .a-status-detalhe-linha--intervalo{
             opacity:0.6;font-style:italic;
         }
+                .a-status-detalhe-linha--aberto{
+            color:#c9bcff;opacity:1;font-style:normal;font-weight:600;
+        }
+        .a-status-tag{
+            display:block;font-size:9.5px;font-weight:700;letter-spacing:.4px;
+            text-transform:uppercase;color:#7878ff;margin-top:1px;
+        }
         .ahg-manual-badge{
             position:absolute;bottom:2px;left:4px;
             font-size:10px;font-weight:700;color:#ffb347;
@@ -2908,6 +3900,32 @@
       };
 
       checarNotifs(ctx);
+
+      // Estado compartilhado: motor reserva + resumo na página de batida
+      {
+        const hojeStr = todayDateStr();
+        const prev = SharedStore.get("ahg_shared_state", null);
+        const prevOk = prev && prev.date === hojeStr ? prev : null;
+        SharedStore.set("ahg_shared_state", {
+          date: hojeStr,
+          updatedAt: Date.now(),
+          frozen,
+          entries: workday.entries.map((e) => ({ type: e.type, time: e.time })),
+          batidas: diaHoje.batidas,
+          manuais: diaHoje.manuais || [],
+          // vendo outro mês: mantém os saldos da semana/mês atuais já publicados
+          saldoSemana: ehMesAtual
+            ? relatorio.saldoSemana
+            : (prevOk?.saldoSemana ?? 0),
+          saldoSemanaComHoje: ehMesAtual
+            ? relatorio.saldoSemanaComHoje
+            : (prevOk?.saldoSemanaComHoje ?? 0),
+          saldoMes: ehMesAtual
+            ? relatorio.resumo.saldoMes
+            : (prevOk?.saldoMes ?? null),
+        });
+      }
+
       if (document.hidden) return;
 
       const p = document.getElementById("ahg-panel");
@@ -2931,8 +3949,8 @@
     // Housekeeping on startup
     WorkdayStore.pruneOld(35);
     ManualPunches.prune(400);
-    NotifScheduler.recover(todayDateStr());
     render();
+    NotifScheduler.recover(todayDateStr());
 
     // Quando a aba volta ao foco: re-verifica imediatamente
     // (cobre o caso de notificações perdidas enquanto a aba estava oculta)
@@ -2976,6 +3994,16 @@
         window.top.location = CONFIG.URL_REFRESH;
       }
     });
+    Ticker.on(1000, () => LunchLive.tick()); // atualiza a janela de retorno do almoço
+    PunchSync.init();
+    Ticker.on(2000, () => PunchSync.tick()); // recarga após registrar o ponto
+    MirrorBeat.beat(); // marca o espelho como aberto imediatamente
+    try {
+      GM_setValue(SessionGuard.KEY, 0); // sessão ok: o próximo logout alerta de imediato
+    } catch {
+      /* silent */
+    }
+    Ticker.on(5000, () => MirrorBeat.beat()); // sinal de vida (roda também em aba oculta)
     Ticker.start();
   }
 
@@ -3020,7 +4048,9 @@
   };
 
   window.ahgTestAlertas = function (tipo = "h8") {
-    const minutos = CONFIG.NOTIFICACOES[tipo] ?? [];
+    const minutos = Array.isArray(CONFIG.NOTIFICACOES[tipo])
+      ? CONFIG.NOTIFICACOES[tipo]
+      : [];
     minutos.forEach((min, idx) => {
       setTimeout(() => {
         notif(
@@ -3044,10 +4074,24 @@
   };
 
   window.ahgTestTudo = function () {
-    Object.keys(CONFIG.NOTIFICACOES).forEach((tipo, idx) => {
-      setTimeout(() => window.ahgTestAlertas(tipo), idx * 15000);
-    });
+    Object.keys(CONFIG.NOTIFICACOES)
+      .filter((k) => Array.isArray(CONFIG.NOTIFICACOES[k]))
+      .forEach((tipo, idx) => {
+        setTimeout(() => window.ahgTestAlertas(tipo), idx * 15000);
+      });
   };
+  window.ahgTestAlmocoLive = function () {
+    LunchLive.start();
+    notif(
+      `dbg-lunchlive-${Date.now()}`,
+      "🍽️ Hora do almoço!",
+      LunchLive.corpo(),
+      true,
+      0,
+      { tag: LunchLive.TAG },
+    );
+  };
+  window.ahgStopAlmocoLive = () => LunchLive.stop();
 
   /* =========================================================
        Top window — recebe mensagens do iframe e dispara notificações
@@ -3075,14 +4119,39 @@
       notif(id, title, body, urgente, ttlMs ?? 60 * 1000);
     });
 
-    let topDeadline = Date.now() + CONFIG.AUTO_REFRESH_MIN * 60 * 1000;
-    Ticker.on(5000, () => {
-      if (Date.now() >= topDeadline) {
+    const naBatida = location.pathname.includes("/novabatidaonline");
+    if (naBatida) {
+      PunchSignal.attach();
+      PunchSummary.init(); // cartão "Resumo do dia" (antes de Ticker.start())
+    }
+
+    // Motor reserva: só atua quando o espelho NÃO está ativo, e só em uma aba
+    const motorReserva = () => !MirrorBeat.isOpen() && Leader.isLeader();
+    Ticker.on(1000, () => {
+      if (motorReserva()) NotifScheduler.tick(); // dispara o que venceu
+    });
+    Ticker.on(60000, () => {
+      if (motorReserva()) NotifScheduler.ensureStatic(); // garante lembretes do dia
+    });
+
+    // Alerta de sessão expirada
+    Ticker.on(5000, () => SessionGuard.check());
+
+    // Recarga periódica: só na página do espelho, e nunca na tela de login
+    if (!naBatida) {
+      let topDeadline = Date.now() + CONFIG.AUTO_REFRESH_MIN * 60 * 1000;
+      Ticker.on(5000, () => {
+        if (Date.now() < topDeadline) return;
+        if (SessionGuard.isLoginPage()) {
+          topDeadline = Date.now() + 60 * 1000; // não apaga a senha que você está digitando
+          return;
+        }
         topDeadline = Infinity;
         console.log("[AHGORA PANEL] reload top");
         location.reload();
-      }
-    });
+      });
+    }
+
     Ticker.start();
     return;
   }
